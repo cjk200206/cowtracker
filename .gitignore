@@ -91,3 +91,5 @@ Thumbs.db
 *.bin
 weights/
 
+data
+
