@@ -1,9 +1,13 @@
 data:
   data_root: data/event_kubric
   split: test
-  seq_len: 24
+  # 24 frames with 448x448 exceeds a single 24GB RTX 3090 during backward.
+  # Start with 8 frames; increase only if memory allows.
+  seq_len: 8
   traj_per_sample: 256
-  crop_size: [384, 512]
+  # Must be divisible by 112 to satisfy VGGT patching, refine ViT, and the original
+  # ResNet deconv skip-add shapes without interpolation.
+  crop_size: [448, 448]
   frame_source: blur
   use_augs: false
   random_temporal_crop: true
@@ -14,12 +18,20 @@ model:
   side_resnet_channels: 128
   down_ratio: 2
   warp_iters: 5
+  # Keep null unless the DPT intermediate indices are changed with it.
   warp_vit_num_blocks: null
+  # VGGT aggregator can be initialized separately via train.vggt_checkpoint.
+  # freeze_vggt=true freezes only VGGT patch-embedding layers; the rest of VGGT is finetuned.
+  # freeze_aggregator=true freezes the whole VGGT aggregator, useful on 24GB GPUs.
+  freeze_vggt: true
   freeze_aggregator: true
   freeze_feature_extractor: false
   freeze_tracking_head: false
 
 train:
+  # Formal training/model dry runs require cowtracker/thirdparty/vggt.
+  # Run: git submodule update --init --recursive
+  # DepthAnythingV2 is not used by this RGB-only training path.
   save_dir: output/train_rgb_tapformer_test
   batch_size: 1
   num_workers: 4
@@ -33,15 +45,23 @@ train:
   grad_clip_norm: 1.0
   precision: bf16
   seed: 0
+  return_all_iters: true
   log_every: 10
   save_every_steps: 1000
   save_best: true
   save_last: true
   best_metric: loss
   best_mode: min
+  # From-scratch CoWTracker training: leave init_checkpoint null and init_from_hf false.
+  # To start from a full CoWTracker checkpoint instead, set init_checkpoint or init_from_hf.
   init_checkpoint: null
-  init_from_hf: true
+  init_from_hf: false
   init_strict: false
+  # Optional: load only VGGT aggregator weights, then control patch-embed freezing with model.freeze_vggt.
+  # Accepts full VGGT/CoWTracker checkpoints with aggregator.* keys or aggregator-only checkpoints.
+  # If model.freeze_vggt is true, set this or use full init weights to avoid freezing random patch embeds.
+  vggt_checkpoint: checkpoints/vggt/model.pt
+  vggt_strict: false
   resume: null
 
 loss:
@@ -49,5 +69,6 @@ loss:
   visibility_weight: 1.0
   confidence_weight: 1.0
   confidence_threshold: 12.0
+  iter_gamma: 0.8
   use_huber: true
   huber_delta: 6.0

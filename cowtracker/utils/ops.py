@@ -148,4 +148,3 @@ def check_cycle_consistency(flow_01, flow_10):
     cycle = np.linalg.norm(cycle, axis=-1)
     mask = (cycle < 0.1 * min(H, W)).astype(np.float32)
     return mask
-

@@ -11,6 +11,7 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from cowtracker.layers.video_transformer import MODEL_CONFIGS, VisionTransformerVideo
 from cowtracker.utils.ops import bilinear_sampler, coords_grid
@@ -94,6 +95,7 @@ class CowTrackingHead(nn.Module):
         features: torch.Tensor,
         image_size: Tuple[int, int],
         first_frame_features: torch.Tensor = None,
+        return_all_iters: bool = False,
     ) -> dict:
         """
         Run Warping-based iterative refinement.
@@ -103,6 +105,8 @@ class CowTrackingHead(nn.Module):
             image_size: Original image size (H_img, W_img) for upsampling.
             first_frame_features: Optional first frame features [B, 1, C, H, W]
                 for cross-window tracking.
+            return_all_iters: If True, also return dense predictions from every
+                warping refinement iteration for training-time sequence loss.
 
         Returns:
             dict with:
@@ -130,6 +134,7 @@ class CowTrackingHead(nn.Module):
 
         # Initialize flow to zero
         flow = torch.zeros(B, S, 2, H, W, device=features.device, dtype=features.dtype)
+        iter_predictions = []
 
         # Iterative refinement
         for _ in range(self.warp_iters):
@@ -150,7 +155,7 @@ class CowTrackingHead(nn.Module):
             ).view(B, S, -1, H, W)
 
             # Apply video transformer with temporal attention
-            refine_out = self.refine_net(refine_inp)["out"]
+            refine_out = self._run_refine_net(refine_inp)
 
             # Update hidden state
             net = self.refine_transform(
@@ -162,13 +167,47 @@ class CowTrackingHead(nn.Module):
             flow = flow + update[:, :, :2]
             info = update[:, :, 2:]
 
-        # Upsample to original resolution
+            if return_all_iters:
+                iter_predictions.append(
+                    self._format_predictions(flow, info, net, H, W, H_img, W_img)
+                )
+
+        predictions = (
+            iter_predictions[-1]
+            if return_all_iters and iter_predictions
+            else self._format_predictions(flow, info, net, H, W, H_img, W_img)
+        )
+
+        if return_all_iters:
+            predictions["track_iters"] = [pred["track"] for pred in iter_predictions]
+            predictions["vis_iters"] = [pred["vis"] for pred in iter_predictions]
+            predictions["conf_iters"] = [pred["conf"] for pred in iter_predictions]
+
+        return predictions
+
+    def _run_refine_net(self, refine_inp: torch.Tensor) -> torch.Tensor:
+        def refine_forward(x):
+            return self.refine_net(x)["out"]
+
+        if self.training and refine_inp.requires_grad:
+            return checkpoint(refine_forward, refine_inp, use_reentrant=False)
+        return refine_forward(refine_inp)
+
+    def _format_predictions(
+        self,
+        flow: torch.Tensor,
+        info: torch.Tensor,
+        net: torch.Tensor,
+        H: int,
+        W: int,
+        H_img: int,
+        W_img: int,
+    ) -> dict:
+        """Upsample low-res flow/info and convert them to public predictions."""
+        B, S = flow.shape[:2]
         weight = 0.25 * self.upsample_weight(net.view(B * S, -1, H, W)).view(B, S, -1, H, W)
         flow_up, info_up = self._upsample_predictions(flow, info, weight)
-
-        # Convert flow to absolute track coordinates
         tracks = self._flow_to_tracks(flow_up, H_img, W_img)
-
         return {
             "track": tracks,
             "vis": torch.sigmoid(info_up[..., 0]),

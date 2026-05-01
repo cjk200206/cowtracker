@@ -55,6 +55,7 @@ class CowTrackerDenseLoss(nn.Module):
         visibility_weight: float = 1.0,
         confidence_weight: float = 1.0,
         confidence_threshold: float = 12.0,
+        iter_gamma: float = 0.8,
         use_huber: bool = True,
         huber_delta: float = 6.0,
     ) -> None:
@@ -63,6 +64,7 @@ class CowTrackerDenseLoss(nn.Module):
         self.visibility_weight = float(visibility_weight)
         self.confidence_weight = float(confidence_weight)
         self.confidence_threshold = float(confidence_threshold)
+        self.iter_gamma = float(iter_gamma)
         self.use_huber = bool(use_huber)
         self.huber_delta = float(huber_delta)
 
@@ -73,34 +75,53 @@ class CowTrackerDenseLoss(nn.Module):
         gt_visibility: torch.Tensor,
         gt_valid: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        track = predictions["track"]
-        vis = predictions["vis"][..., None]
-        conf = predictions["conf"][..., None]
-
         query_xy = gt_trajectory[:, 0].detach()
-        pred_track = sample_dense_predictions(track, query_xy)
-        pred_vis = sample_dense_predictions(vis, query_xy).squeeze(-1).clamp(1e-4, 1.0 - 1e-4)
-        pred_conf = sample_dense_predictions(conf, query_xy).squeeze(-1).clamp(1e-4, 1.0 - 1e-4)
-
         gt_visibility = gt_visibility.float()
         gt_valid = gt_valid.float()
         finite = torch.isfinite(gt_trajectory).all(dim=-1).float()
         valid = gt_valid * finite
         visible_valid = valid * gt_visibility
 
-        if self.use_huber:
-            coord_elem = _huber_loss(pred_track, gt_trajectory, self.huber_delta).mean(dim=-1)
-        else:
-            coord_elem = (pred_track - gt_trajectory).abs().mean(dim=-1)
-        coord_loss = _masked_mean(coord_elem, visible_valid)
+        dense_predictions = self._iter_prediction_triplets(predictions)
+        n_iters = len(dense_predictions)
+        coord_loss = gt_trajectory.new_zeros(())
+        visibility_loss = gt_trajectory.new_zeros(())
+        confidence_loss = gt_trajectory.new_zeros(())
 
-        vis_elem = F.binary_cross_entropy(pred_vis, gt_visibility, reduction="none")
-        visibility_loss = _masked_mean(vis_elem, valid)
+        sampled_tracks = []
+        sampled_visibilities = []
+        sampled_confidences = []
 
-        err_sq = torch.sum((pred_track.detach() - gt_trajectory) ** 2, dim=-1)
-        conf_target = (err_sq <= self.confidence_threshold**2).float()
-        conf_elem = F.binary_cross_entropy(pred_conf, conf_target, reduction="none")
-        confidence_loss = _masked_mean(conf_elem, visible_valid)
+        for iter_idx, (track, vis, conf) in enumerate(dense_predictions):
+            pred_track = sample_dense_predictions(track, query_xy)
+            pred_vis = sample_dense_predictions(vis[..., None], query_xy).squeeze(-1).clamp(1e-4, 1.0 - 1e-4)
+            pred_conf = sample_dense_predictions(conf[..., None], query_xy).squeeze(-1).clamp(1e-4, 1.0 - 1e-4)
+            iter_weight = self.iter_gamma ** (n_iters - iter_idx - 1)
+
+            coord_i, vis_i, conf_i = self._compute_single_losses(
+                pred_track,
+                pred_vis,
+                pred_conf,
+                gt_trajectory,
+                gt_visibility,
+                valid,
+                visible_valid,
+            )
+
+            coord_loss = coord_loss + iter_weight * coord_i
+            visibility_loss = visibility_loss + iter_weight * vis_i
+            confidence_loss = confidence_loss + iter_weight * conf_i
+            sampled_tracks.append(pred_track)
+            sampled_visibilities.append(pred_vis)
+            sampled_confidences.append(pred_conf)
+
+        coord_loss = coord_loss / n_iters
+        visibility_loss = visibility_loss / n_iters
+        confidence_loss = confidence_loss / n_iters
+
+        pred_track = sampled_tracks[-1]
+        pred_vis = sampled_visibilities[-1]
+        pred_conf = sampled_confidences[-1]
 
         loss = (
             self.coord_weight * coord_loss
@@ -117,9 +138,61 @@ class CowTrackerDenseLoss(nn.Module):
             "coord_loss": coord_loss,
             "visibility_loss": visibility_loss,
             "confidence_loss": confidence_loss,
+            "loss_coord": coord_loss,
+            "loss_vis": visibility_loss,
+            "loss_conf": confidence_loss,
             "final_epe": final_epe,
             "vis_acc": vis_acc,
             "pred_track": pred_track,
             "pred_visibility": pred_vis,
             "pred_confidence": pred_conf,
         }
+
+    @staticmethod
+    def _iter_prediction_triplets(predictions: dict[str, torch.Tensor]):
+        if all(key in predictions for key in ("track_iters", "vis_iters", "conf_iters")):
+            triplets = list(
+                zip(
+                    predictions["track_iters"],
+                    predictions["vis_iters"],
+                    predictions["conf_iters"],
+                )
+            )
+            if len(triplets) > 0:
+                return triplets
+        return [(predictions["track"], predictions["vis"], predictions["conf"])]
+
+    def _compute_single_losses(
+        self,
+        pred_track: torch.Tensor,
+        pred_vis: torch.Tensor,
+        pred_conf: torch.Tensor,
+        gt_trajectory: torch.Tensor,
+        gt_visibility: torch.Tensor,
+        valid: torch.Tensor,
+        visible_valid: torch.Tensor,
+    ):
+        if self.use_huber:
+            coord_elem = _huber_loss(pred_track, gt_trajectory, self.huber_delta).mean(dim=-1)
+        else:
+            coord_elem = (pred_track - gt_trajectory).abs().mean(dim=-1)
+        coord_loss = _masked_mean(coord_elem, visible_valid)
+
+        with torch.autocast(device_type=pred_vis.device.type, enabled=False):
+            vis_elem = F.binary_cross_entropy(
+                pred_vis.float(),
+                gt_visibility.float(),
+                reduction="none",
+            )
+        visibility_loss = _masked_mean(vis_elem, valid)
+
+        err_sq = torch.sum((pred_track.detach() - gt_trajectory) ** 2, dim=-1)
+        conf_target = (err_sq <= self.confidence_threshold**2).float()
+        with torch.autocast(device_type=pred_conf.device.type, enabled=False):
+            conf_elem = F.binary_cross_entropy(
+                pred_conf.float(),
+                conf_target.float(),
+                reduction="none",
+            )
+        confidence_loss = _masked_mean(conf_elem, visible_valid)
+        return coord_loss, visibility_loss, confidence_loss

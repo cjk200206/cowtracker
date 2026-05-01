@@ -82,13 +82,20 @@ class CoWTracker(nn.Module, PyTorchModelHubMixin):
         print(f"  - Features: {features}, Side channels: {side_resnet_channels}")
         print(f"  - Warping-based iterative refinement iterations: {warp_iters}")
 
-    def forward(self, video: torch.Tensor, queries: torch.Tensor = None) -> dict:
+    def forward(
+        self,
+        video: torch.Tensor,
+        queries: torch.Tensor = None,
+        return_all_iters: bool = False,
+    ) -> dict:
         """
         Forward pass for dense tracking.
 
         Args:
             video: Input video [B, S, 3, H, W] or [S, 3, H, W] in range [0, 255].
             queries: Optional query points (unused, for API compatibility).
+            return_all_iters: If True, include per-warp-iteration dense predictions
+                for training losses. Defaults to False to preserve inference API.
 
         Returns:
             dict with:
@@ -110,7 +117,11 @@ class CoWTracker(nn.Module, PyTorchModelHubMixin):
         features = self.feature_extractor(tokens, images, patch_idx)
 
         # Run tracking
-        predictions = self.tracking_head(features, image_size=(H, W))
+        predictions = self.tracking_head(
+            features,
+            image_size=(H, W),
+            return_all_iters=return_all_iters,
+        )
 
         if not self.training:
             predictions["images"] = images

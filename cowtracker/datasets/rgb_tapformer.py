@@ -328,11 +328,17 @@ class RGBTapFormerDataset(Dataset):
             displacement = torch.linalg.vector_norm(
                 traj[-1, visible_inds] - traj[0, visible_inds], dim=-1
             )
-            probs = displacement / displacement.sum().clamp_min(1e-6)
-            replace = visible_inds.numel() < self.traj_per_sample
-            sampled_pos = torch.multinomial(probs, self.traj_per_sample, replacement=replace)
+            if displacement.sum() > 1e-6:
+                probs = displacement / displacement.sum()
+            else:
+                probs = torch.full_like(displacement, 1.0 / visible_inds.numel())
+            real_count = min(visible_inds.numel(), self.traj_per_sample)
+            sampled_pos = torch.multinomial(probs, real_count, replacement=False)
             selected = visible_inds[sampled_pos]
-            valid_points[: min(visible_inds.numel(), self.traj_per_sample)] = True
+            valid_points[:real_count] = True
+            if real_count < self.traj_per_sample:
+                pad = selected[torch.arange(self.traj_per_sample - real_count) % real_count]
+                selected = torch.cat([selected, pad], dim=0)
             return selected, valid_points
 
         order = torch.randperm(visible_inds.numel())

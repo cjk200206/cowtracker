@@ -100,13 +100,31 @@ class FlashAttention3(nn.Module):
         self.flash_ops = _get_flash_attention_ops()
 
     def forward(
-        self, x: torch.Tensor, attn_mask: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        is_causal: bool = False,
     ) -> torch.Tensor:
         B, N, C = x.shape
 
         # Compute Q, K, V
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(2)  # Each is (B, N, num_heads, head_dim)
+
+        if q.dtype not in (torch.float16, torch.bfloat16) or self.flash_ops is None or is_causal:
+            x = F.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                attn_mask=attn_mask,
+                dropout_p=self.attn_drop if self.training else 0.0,
+                is_causal=is_causal,
+                scale=self.scale,
+            ).transpose(1, 2)
+            x = x.reshape(B, N, C)
+            x = self.proj(x)
+            x = self.proj_drop(x)
+            return x
 
         # xformers expects [B, M, H, K] format - we already have it!
         # Use xformers memory_efficient_attention with Flash Attention 3
@@ -408,4 +426,3 @@ class VisionTransformerVideo(nn.Module):
             "path_3": bt_to_btensor(path_3),
             "path_4": bt_to_btensor(path_4),
         }
-

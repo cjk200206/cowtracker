@@ -36,6 +36,7 @@ def parse_args():
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--dry_run_loader", action="store_true")
+    parser.add_argument("--dry_run_model", action="store_true")
     return parser.parse_args()
 
 
@@ -88,6 +89,78 @@ def normalize_state_dict_keys(state_dict):
     return state_dict
 
 
+def select_aggregator_state_dict(state_dict, target_keys):
+    """Extract VGGT aggregator weights from full-model or aggregator-only checkpoints."""
+    state_dict = normalize_state_dict_keys(state_dict)
+    prefixes = ("aggregator.", "model.aggregator.", "module.aggregator.")
+    for prefix in prefixes:
+        selected = {
+            k[len(prefix) :]: v
+            for k, v in state_dict.items()
+            if k.startswith(prefix)
+        }
+        if selected:
+            return selected
+
+    target_keys = set(target_keys)
+    selected = {k: v for k, v in state_dict.items() if k in target_keys}
+    if selected:
+        return selected
+
+    raise ValueError(
+        "Could not find VGGT aggregator weights in checkpoint. Expected keys like "
+        "'aggregator.*' from a full VGGT/CoWTracker checkpoint, or direct aggregator "
+        "keys matching model.aggregator.state_dict()."
+    )
+
+
+def load_vggt_checkpoint(model, checkpoint_path, strict=False):
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = extract_state_dict(ckpt)
+    target_keys = model.aggregator.state_dict().keys()
+    aggregator_state = select_aggregator_state_dict(state_dict, target_keys)
+    incompatible = model.aggregator.load_state_dict(aggregator_state, strict=bool(strict))
+    print(
+        "Loaded VGGT aggregator weights "
+        f"from {checkpoint_path} "
+        f"(missing={len(incompatible.missing_keys)}, unexpected={len(incompatible.unexpected_keys)})",
+        flush=True,
+    )
+    return incompatible
+
+
+def vggt_patch_embedding_modules(aggregator):
+    """
+    Return the image-to-patch embedding modules in VGGT.
+
+    For the DINOv2 patch embed used by CoWTracker, aggregator.patch_embed is a
+    ViT and aggregator.patch_embed.patch_embed is the actual image projection.
+    For a plain conv PatchEmbed backbone, aggregator.patch_embed itself is the
+    image projection.
+    """
+    patch_embed = getattr(aggregator, "patch_embed", None)
+    if patch_embed is None:
+        raise AttributeError("VGGT aggregator does not expose a patch_embed module.")
+    inner_patch_embed = getattr(patch_embed, "patch_embed", None)
+    return [inner_patch_embed if inner_patch_embed is not None else patch_embed]
+
+
+def freeze_vggt_patch_embedding(model):
+    frozen = 0
+    modules = vggt_patch_embedding_modules(model.aggregator)
+    for module in modules:
+        for p in module.parameters():
+            if p.requires_grad:
+                frozen += p.numel()
+            p.requires_grad = False
+    return frozen
+
+
+def set_vggt_patch_embedding_eval(model):
+    for module in vggt_patch_embedding_modules(model.aggregator):
+        module.eval()
+
+
 def build_dataset(cfg):
     data_cfg = cfg["data"]
     return RGBTapFormerDataset(
@@ -103,11 +176,30 @@ def build_dataset(cfg):
     )
 
 
+def ensure_vggt_available():
+    vggt_root = ROOT / "cowtracker" / "thirdparty" / "vggt"
+    required_files = [
+        vggt_root / "vggt" / "models" / "aggregator.py",
+        vggt_root / "vggt" / "heads" / "dpt_head.py",
+    ]
+    missing = [path for path in required_files if not path.is_file()]
+    if missing:
+        missing_rel = "\n".join(f"  - {path.relative_to(ROOT)}" for path in missing)
+        raise FileNotFoundError(
+            "VGGT submodule is required for CoWTracker model forward, but files are missing:\n"
+            f"{missing_rel}\n"
+            "Run: git submodule update --init --recursive\n"
+            "--dry_run_loader only checks the dataset and does not validate VGGT."
+        )
+
+
 def build_model(cfg, device):
+    ensure_vggt_available()
     from cowtracker.models.cowtracker import CoWTracker
 
     model_cfg = dict(cfg.get("model", {}))
-    freeze_aggregator = bool(model_cfg.pop("freeze_aggregator", True))
+    freeze_aggregator = bool(model_cfg.pop("freeze_aggregator", False))
+    freeze_vggt = bool(model_cfg.pop("freeze_vggt", True))
     freeze_feature_extractor = bool(model_cfg.pop("freeze_feature_extractor", False))
     freeze_tracking_head = bool(model_cfg.pop("freeze_tracking_head", False))
     model = CoWTracker(**model_cfg).to(device)
@@ -133,9 +225,39 @@ def build_model(cfg, device):
             flush=True,
         )
 
+    vggt_checkpoint = train_cfg.get("vggt_checkpoint")
+    if vggt_checkpoint:
+        if init_checkpoint or init_from_hf:
+            print(
+                "vggt_checkpoint is set; its aggregator weights will override aggregator "
+                "weights loaded from init_checkpoint/init_from_hf.",
+                flush=True,
+            )
+        load_vggt_checkpoint(
+            model,
+            vggt_checkpoint,
+            strict=bool(train_cfg.get("vggt_strict", False)),
+        )
+    elif (freeze_aggregator or freeze_vggt) and not (init_checkpoint or init_from_hf):
+        print(
+            "Warning: VGGT freezing is enabled but no full init weights or vggt_checkpoint "
+            "were provided, so randomly initialized VGGT weights will be frozen.",
+            flush=True,
+        )
+
     if freeze_aggregator:
         for p in model.aggregator.parameters():
             p.requires_grad = False
+        print("VGGT aggregator frozen.", flush=True)
+    elif freeze_vggt:
+        frozen = freeze_vggt_patch_embedding(model)
+        print(
+            "VGGT patch-embedding layers frozen; the rest of the VGGT backbone "
+            f"remains trainable. Frozen parameters: {frozen:,}",
+            flush=True,
+        )
+    else:
+        print("VGGT backbone fully trainable.", flush=True)
     if freeze_feature_extractor:
         for p in model.feature_extractor.parameters():
             p.requires_grad = False
@@ -152,8 +274,10 @@ def build_model(cfg, device):
 
 def set_frozen_modules_eval(model, cfg):
     model_cfg = cfg.get("model", {})
-    if bool(model_cfg.get("freeze_aggregator", True)):
+    if bool(model_cfg.get("freeze_aggregator", False)):
         model.aggregator.eval()
+    elif bool(model_cfg.get("freeze_vggt", True)):
+        set_vggt_patch_embedding_eval(model)
     if bool(model_cfg.get("freeze_feature_extractor", False)):
         model.feature_extractor.eval()
     if bool(model_cfg.get("freeze_tracking_head", False)):
@@ -254,6 +378,25 @@ def main():
     grad_clip_norm = float(train_cfg.get("grad_clip_norm", 1.0))
     log_every = int(train_cfg.get("log_every", 10))
     save_every_steps = int(train_cfg.get("save_every_steps", 1000))
+    return_all_iters = bool(train_cfg.get("return_all_iters", False))
+
+    if args.dry_run_model:
+        batch, gotit = next(iter(loader))
+        if not bool(gotit.all()):
+            raise RuntimeError(f"dry_run_model got invalid sample flags: {gotit.tolist()}")
+        batch = move_batch_to_device(batch, device)
+        model.train()
+        set_frozen_modules_eval(model, cfg)
+        use_amp = amp_dtype is not None and device.type == "cuda"
+        with torch.no_grad():
+            with torch.autocast(device_type=device.type, dtype=amp_dtype or torch.float32, enabled=use_amp):
+                predictions = model(batch.video, return_all_iters=return_all_iters)
+                loss_dict = criterion(predictions, batch.trajectory, batch.visibility, batch.valid)
+        print(f"track={tuple(predictions['track'].shape)}")
+        if "track_iters" in predictions:
+            print(f"track_iters={len(predictions['track_iters'])}")
+        print(f"loss={float(loss_dict['loss']):.4f}")
+        return
 
     last_epoch = start_epoch - 1
     for epoch in range(start_epoch, int(train_cfg.get("epochs", 40))):
@@ -265,6 +408,9 @@ def main():
             "coord_loss": 0.0,
             "visibility_loss": 0.0,
             "confidence_loss": 0.0,
+            "loss_coord": 0.0,
+            "loss_vis": 0.0,
+            "loss_conf": 0.0,
             "final_epe": 0.0,
             "vis_acc": 0.0,
         }
@@ -278,7 +424,7 @@ def main():
 
             use_amp = amp_dtype is not None and device.type == "cuda"
             with torch.autocast(device_type=device.type, dtype=amp_dtype or torch.float32, enabled=use_amp):
-                predictions = model(batch.video)
+                predictions = model(batch.video, return_all_iters=return_all_iters)
                 loss_dict = criterion(predictions, batch.trajectory, batch.visibility, batch.valid)
                 loss = loss_dict["loss"]
 
@@ -303,9 +449,9 @@ def main():
                 print(
                     f"epoch={epoch} step={global_step} "
                     f"loss={running['loss']/denom:.4f} "
-                    f"coord={running['coord_loss']/denom:.4f} "
-                    f"vis={running['visibility_loss']/denom:.4f} "
-                    f"conf={running['confidence_loss']/denom:.4f} "
+                    f"loss_coord={running['loss_coord']/denom:.4f} "
+                    f"loss_vis={running['loss_vis']/denom:.4f} "
+                    f"loss_conf={running['loss_conf']/denom:.4f} "
                     f"epe={running['final_epe']/denom:.4f}",
                     flush=True,
                 )
@@ -331,8 +477,10 @@ def main():
                 )
                 print(f"[Best] epoch={epoch} {best_metric_name}={best_metric:.4f}", flush=True)
             print(
-                f"[Epoch {epoch}] loss={metrics['loss']:.4f}, coord={metrics['coord_loss']:.4f}, "
-                f"vis={metrics['visibility_loss']:.4f}, conf={metrics['confidence_loss']:.4f}",
+                f"[Epoch {epoch}] loss={metrics['loss']:.4f}, "
+                f"loss_coord={metrics['loss_coord']:.4f}, "
+                f"loss_vis={metrics['loss_vis']:.4f}, "
+                f"loss_conf={metrics['loss_conf']:.4f}",
                 flush=True,
             )
 

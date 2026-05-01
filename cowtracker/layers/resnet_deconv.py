@@ -58,4 +58,3 @@ class ResNet18Deconv(nn.Module):
         out_2 = self.proj_2(out_2 + self.up_3(out_3))
         out_1 = self.proj_1(out_1 + self.up_2(out_2))
         return [out_1, out_2, out_3, out_4]
-
