@@ -3,7 +3,8 @@ import torch
 from PIL import Image
 
 from cowtracker.datasets import RGBTapFormerDataset, cow_rgb_collate
-from cowtracker.training.losses import CowTrackerDenseLoss
+from cowtracker.training.losses import CowTrackerDenseLoss, sample_dense_predictions
+from cowtracker.utils.visualization import TrackVisualizer
 from scripts.train_cowtracker import freeze_vggt_patch_embedding, select_aggregator_state_dict
 
 
@@ -73,6 +74,45 @@ def test_dense_loss_backward():
     assert out["loss_coord"] is out["coord_loss"]
     assert out["loss_vis"] is out["visibility_loss"]
     assert out["loss_conf"] is out["confidence_loss"]
+
+
+def test_sample_dense_predictions_for_visualization():
+    b, t, h, w = 1, 2, 6, 8
+    yy, xx = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
+    dense = torch.stack([xx, yy], dim=-1).float()[None, None].repeat(b, t, 1, 1, 1)
+    query_xy = torch.tensor([[[2.0, 3.0], [5.0, 1.0]]])
+
+    sampled = sample_dense_predictions(dense, query_xy)
+
+    assert sampled.shape == (b, t, 2, 2)
+    assert torch.allclose(sampled[:, :, 0], torch.tensor([[[2.0, 3.0], [2.0, 3.0]]]))
+    assert torch.allclose(sampled[:, :, 1], torch.tensor([[[5.0, 1.0], [5.0, 1.0]]]))
+
+
+def test_track_visualizer_renders_cotracker_style_frames(tmp_path):
+    video = torch.zeros(1, 3, 3, 16, 20)
+    video[:, :, 0] = 64
+    tracks = torch.tensor(
+        [
+            [
+                [[3.0, 4.0], [10.0, 12.0]],
+                [[5.0, 4.0], [11.0, 12.0]],
+                [[7.0, 4.0], [12.0, 12.0]],
+            ]
+        ]
+    )
+    visibility = torch.tensor([[[True, True], [True, False], [True, True]]])
+    visualizer = TrackVisualizer(
+        save_dir=str(tmp_path),
+        show_first_frame=2,
+        tracks_leave_trace=-1,
+    )
+
+    rendered = visualizer.visualize(video, tracks, visibility, filename=None)
+
+    assert rendered.shape == (5, 16, 20, 3)
+    assert rendered.dtype == np.uint8
+    assert rendered.max() > 64
 
 
 def test_dense_loss_supports_iteration_predictions():
