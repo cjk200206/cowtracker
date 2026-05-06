@@ -13,6 +13,10 @@ def __getattr__(name):
         from cowtracker.models.cowtracker import CoWTracker
 
         return CoWTracker
+    if name == "CoWTrackerOnline":
+        from cowtracker.models.cowtracker_online import CoWTrackerOnline
+
+        return CoWTrackerOnline
     if name == "CoWTrackerWindowed":
         from cowtracker.models.cowtracker_windowed import CoWTrackerWindowed
 
@@ -20,4 +24,4 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-__all__ = ["CoWTracker", "CoWTrackerWindowed"]
+__all__ = ["CoWTracker", "CoWTrackerOnline", "CoWTrackerWindowed"]

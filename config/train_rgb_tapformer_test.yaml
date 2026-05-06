@@ -38,7 +38,7 @@ train:
   shuffle: true
   pin_memory: true
   drop_last: true
-  epochs: 40
+  epochs: 500
   max_steps: null
   lr: 0.0005
   weight_decay: 0.0001

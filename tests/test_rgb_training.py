@@ -115,6 +115,79 @@ def test_track_visualizer_renders_cotracker_style_frames(tmp_path):
     assert rendered.max() > 64
 
 
+def test_cowtracker_online_sliding_windows_use_first_frame_anchor():
+    from cowtracker.models.cowtracker_online import CoWTrackerOnline
+
+    class TinyOnline(CoWTrackerOnline):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.window_len = 4
+            self.window_stride = 2
+            self.merge_mode = "overwrite"
+            self.last_windows = []
+            self.calls = []
+
+        def _forward_window_video(self, video, queries=None, return_all_iters=False):
+            del queries, return_all_iters
+            self.calls.append(video[:, :, 0, 0, 0].detach().cpu().tolist()[0])
+            b, t, _, h, w = video.shape
+            frame_values = video[:, :, 0, 0, 0].view(b, t, 1, 1)
+            track = video.new_zeros((b, t, h, w, 2))
+            track[..., 0] = frame_values
+            return {
+                "track": track,
+                "vis": video.new_ones((b, t, h, w)),
+                "conf": video.new_ones((b, t, h, w)),
+            }
+
+    model = TinyOnline().eval()
+    video = torch.arange(10).view(1, 10, 1, 1, 1).repeat(1, 1, 3, 2, 2).float()
+
+    out = model(video)
+
+    assert model.last_windows == [(0, 4), (2, 6), (4, 8), (6, 10)]
+    assert model.calls == [
+        [0.0, 1.0, 2.0, 3.0],
+        [0.0, 2.0, 3.0, 4.0, 5.0],
+        [0.0, 4.0, 5.0, 6.0, 7.0],
+        [0.0, 6.0, 7.0, 8.0, 9.0],
+    ]
+    assert out["track"].shape == (1, 10, 2, 2, 2)
+    assert torch.equal(out["track"][0, :, 0, 0, 0], torch.arange(10).float())
+
+
+def test_cowtracker_online_short_video_uses_single_window():
+    from cowtracker.models.cowtracker_online import CoWTrackerOnline
+
+    class TinyOnline(CoWTrackerOnline):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.window_len = 4
+            self.window_stride = 2
+            self.merge_mode = "overwrite"
+            self.last_windows = []
+            self.calls = 0
+
+        def _forward_window_video(self, video, queries=None, return_all_iters=False):
+            del queries, return_all_iters
+            self.calls += 1
+            b, t, _, h, w = video.shape
+            return {
+                "track": video.new_zeros((b, t, h, w, 2)),
+                "vis": video.new_ones((b, t, h, w)),
+                "conf": video.new_ones((b, t, h, w)),
+            }
+
+    model = TinyOnline().eval()
+    video = torch.zeros(1, 3, 3, 2, 2)
+
+    out = model(video)
+
+    assert model.last_windows == [(0, 3)]
+    assert model.calls == 1
+    assert out["track"].shape[1] == 3
+
+
 def test_dense_loss_supports_iteration_predictions():
     b, t, h, w, n = 1, 3, 8, 10, 2
     yy, xx = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")

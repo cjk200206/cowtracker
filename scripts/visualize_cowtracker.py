@@ -53,6 +53,10 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="output/vis_cowtracker")
     parser.add_argument("--sample_index", type=int, default=0)
     parser.add_argument("--seq_len", type=int, default=None)
+    parser.add_argument("--full_sequence", action="store_true")
+    parser.add_argument("--online", action="store_true")
+    parser.add_argument("--window_len", type=int, default=None)
+    parser.add_argument("--window_stride", type=int, default=None)
     parser.add_argument("--num_points", type=int, default=128)
     parser.add_argument("--point_source", choices=("gt", "grid"), default="gt")
     parser.add_argument("--precision", choices=("bf16", "fp16", "fp32"), default=None)
@@ -93,12 +97,29 @@ def model_kwargs_from_config(cfg: dict) -> dict:
     return model_cfg
 
 
-def build_visualization_model(ckpt, cfg: dict, device: torch.device):
+def build_visualization_model(
+    ckpt,
+    cfg: dict,
+    device: torch.device,
+    use_online: bool = False,
+    window_len: int | None = None,
+    window_stride: int | None = None,
+):
     ensure_vggt_available()
     from cowtracker.models.cowtracker import CoWTracker
+    from cowtracker.models.cowtracker_online import CoWTrackerOnline
 
     model_cfg_source = ckpt.get("config", cfg) if isinstance(ckpt, dict) else cfg
-    model = CoWTracker(**model_kwargs_from_config(model_cfg_source)).to(device)
+    model_kwargs = model_kwargs_from_config(model_cfg_source)
+    if use_online:
+        resolved_window_len = int(window_len or cfg.get("data", {}).get("seq_len", 8))
+        model = CoWTrackerOnline(
+            window_len=resolved_window_len,
+            window_stride=window_stride,
+            **model_kwargs,
+        ).to(device)
+    else:
+        model = CoWTracker(**model_kwargs).to(device)
     state_dict = extract_state_dict(ckpt)
     state_dict = normalize_state_dict_keys(state_dict)
 
@@ -109,6 +130,8 @@ def build_visualization_model(ckpt, cfg: dict, device: torch.device):
     ]
     if any(k.startswith(prefix) for k in state_dict for prefix in legacy_prefixes):
         state_dict = CoWTracker._remap_legacy_state_dict(state_dict)
+    if state_dict and all(k.startswith("model.") for k in state_dict):
+        state_dict = {k[len("model.") :]: v for k, v in state_dict.items()}
 
     incompatible = model.load_state_dict(state_dict, strict=False)
     print(
@@ -131,6 +154,16 @@ def build_visualization_dataset(cfg: dict, random_temporal_crop: bool, seq_len: 
             raise ValueError("--seq_len must be a positive integer.")
         vis_cfg["data"]["seq_len"] = int(seq_len)
     return build_dataset(vis_cfg)
+
+
+def full_sequence_len(dataset, sample_index: int) -> int:
+    index = int(sample_index) % len(dataset)
+    seq_path = dataset.seq_paths[index]
+    frame_paths = dataset._frame_paths(seq_path / "raw")
+    annot = np.load(seq_path / "annotations.npy", allow_pickle=True).item()
+    traj = np.asarray(annot["target_points"])
+    occluded = np.asarray(annot["occluded"])
+    return int(min(len(frame_paths), traj.shape[1], occluded.shape[1]))
 
 
 def load_one_batch(dataset, sample_index: int, num_workers: int):
@@ -212,16 +245,32 @@ def main():
     amp_dtype = autocast_dtype(precision)
     use_amp = amp_dtype is not None and device.type == "cuda"
 
+    seq_len_override = args.seq_len
     dataset = build_visualization_dataset(
         cfg,
         random_temporal_crop=args.random_temporal_crop,
-        seq_len=args.seq_len,
+        seq_len=seq_len_override,
     )
+    if args.full_sequence and seq_len_override is None:
+        seq_len_override = full_sequence_len(dataset, args.sample_index)
+        dataset = build_visualization_dataset(
+            cfg,
+            random_temporal_crop=args.random_temporal_crop,
+            seq_len=seq_len_override,
+        )
     batch, resolved_index = load_one_batch(dataset, args.sample_index, args.num_workers)
     batch = move_batch_to_device(batch, device)
     input_frames = int(batch.video.shape[1])
 
-    model = build_visualization_model(ckpt, cfg, device)
+    use_online = bool(args.online or args.full_sequence or args.window_len is not None)
+    model = build_visualization_model(
+        ckpt,
+        cfg,
+        device,
+        use_online=use_online,
+        window_len=args.window_len,
+        window_stride=args.window_stride,
+    )
     with torch.no_grad():
         with torch.autocast(device_type=device.type, dtype=amp_dtype or torch.float32, enabled=use_amp):
             predictions = model(batch.video, return_all_iters=False)
@@ -275,7 +324,11 @@ def main():
         f"seq_name={seq_name} sample_index={resolved_index} "
         f"input_frames={input_frames} "
         f"show_first_frame={args.show_first_frame} "
-        f"rendered_frames={rendered.shape[0]}",
+        f"rendered_frames={rendered.shape[0]} "
+        f"online={use_online} "
+        f"window_len={getattr(model, 'window_len', None)} "
+        f"window_stride={getattr(model, 'window_stride', None)} "
+        f"num_windows={len(getattr(model, 'last_windows', []))}",
         flush=True,
     )
     print(f"Rendered frames: {tuple(rendered.shape)}", flush=True)

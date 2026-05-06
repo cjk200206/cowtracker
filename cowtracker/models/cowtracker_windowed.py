@@ -216,3 +216,57 @@ class CoWTrackerWindowed(nn.Module, PyTorchModelHubMixin):
         print("Model loaded successfully!")
         return model
 
+
+# Compatibility class. This final definition intentionally shadows the legacy
+# wrapper above so existing imports keep working while using the inherited
+# CoWTrackerOnline module layout and checkpoint keys.
+from cowtracker.models.cowtracker_online import CoWTrackerOnline  # noqa: E402
+
+
+class CoWTrackerWindowed(CoWTrackerOnline):
+    """Backward-compatible name for the inherited online/windowed tracker."""
+
+    def __init__(
+        self,
+        window_len: int = 100,
+        stride: int | None = None,
+        num_memory_frames: int = 10,
+        window_stride: int | None = None,
+        merge_mode: str = "overwrite",
+        **cow_tracker_kwargs,
+    ) -> None:
+        del num_memory_frames
+        resolved_stride = window_stride if window_stride is not None else stride
+        if resolved_stride is None:
+            resolved_stride = window_len
+        super().__init__(
+            window_len=window_len,
+            window_stride=resolved_stride,
+            merge_mode=merge_mode,
+            **cow_tracker_kwargs,
+        )
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        checkpoint_path: str = None,
+        window_len: int = 100,
+        stride: int | None = None,
+        window_stride: int | None = None,
+        merge_mode: str = "overwrite",
+        device: str = "cuda",
+        dtype=torch.bfloat16,
+        **cow_tracker_kwargs,
+    ):
+        resolved_stride = window_stride if window_stride is not None else stride
+        if resolved_stride is None:
+            resolved_stride = window_len
+        return super().from_checkpoint(
+            checkpoint_path=checkpoint_path,
+            window_len=window_len,
+            window_stride=resolved_stride,
+            merge_mode=merge_mode,
+            device=device,
+            dtype=dtype,
+            **cow_tracker_kwargs,
+        )
