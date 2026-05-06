@@ -72,6 +72,7 @@ def test_dense_loss_backward():
     assert torch.isfinite(out["loss"])
     assert dense_track.grad is not None
     assert out["loss_coord"] is out["coord_loss"]
+    assert out["loss_invisible_coord"] is out["invisible_coord_loss"]
     assert out["loss_vis"] is out["visibility_loss"]
     assert out["loss_conf"] is out["confidence_loss"]
 
@@ -266,6 +267,93 @@ def test_iter_gamma_weights_later_predictions_more():
         valid,
     )
     assert late_bad["coord_loss"] > early_bad["coord_loss"]
+
+
+def test_iter_gamma_does_not_reweight_visibility_or_confidence_losses():
+    b, t, h, w, n = 1, 2, 2, 2, 1
+    track = torch.zeros(b, t, h, w, 2)
+    vis_good = torch.full((b, t, h, w), 0.9)
+    vis_bad = torch.full((b, t, h, w), 0.2)
+    conf_good = torch.full((b, t, h, w), 0.9)
+    conf_bad = torch.full((b, t, h, w), 0.2)
+    gt = torch.zeros(b, t, n, 2)
+    visibility = torch.ones(b, t, n)
+    valid = torch.ones(b, t, n)
+
+    criterion = CowTrackerDenseLoss(iter_gamma=0.1)
+    early_bad = criterion(
+        {
+            "track": track,
+            "vis": vis_good,
+            "conf": conf_good,
+            "track_iters": [track, track],
+            "vis_iters": [vis_bad, vis_good],
+            "conf_iters": [conf_bad, conf_good],
+        },
+        gt,
+        visibility,
+        valid,
+    )
+    late_bad = criterion(
+        {
+            "track": track,
+            "vis": vis_bad,
+            "conf": conf_bad,
+            "track_iters": [track, track],
+            "vis_iters": [vis_good, vis_bad],
+            "conf_iters": [conf_good, conf_bad],
+        },
+        gt,
+        visibility,
+        valid,
+    )
+
+    assert torch.allclose(early_bad["visibility_loss"], late_bad["visibility_loss"])
+    assert torch.allclose(early_bad["confidence_loss"], late_bad["confidence_loss"])
+
+
+def test_invisible_points_use_auxiliary_coord_loss_not_visible_coord_loss():
+    b, t, h, w, n = 1, 2, 6, 6, 1
+    track = torch.zeros(b, t, h, w, 2)
+    vis = torch.full((b, t, h, w), 0.8)
+    conf = torch.full((b, t, h, w), 0.8)
+    gt = torch.tensor([[[[0.0, 0.0]], [[4.0, 4.0]]]])
+    visibility = torch.tensor([[[1.0], [0.0]]])
+    valid = torch.ones(b, t, n)
+
+    criterion = CowTrackerDenseLoss(
+        coord_weight=1.0,
+        invisible_coord_weight=1.0,
+        visibility_weight=0.0,
+        confidence_weight=0.0,
+        use_huber=False,
+    )
+    out = criterion({"track": track, "vis": vis, "conf": conf}, gt, visibility, valid)
+
+    assert torch.allclose(out["coord_loss"], torch.tensor(0.0))
+    assert torch.allclose(out["invisible_coord_loss"], torch.tensor(4.0))
+    assert torch.allclose(out["loss"], torch.tensor(4.0))
+
+
+def test_invisible_coord_weight_zero_keeps_total_loss_compatible():
+    b, t, h, w, n = 1, 2, 6, 6, 1
+    track = torch.zeros(b, t, h, w, 2)
+    vis = torch.full((b, t, h, w), 0.8)
+    conf = torch.full((b, t, h, w), 0.8)
+    gt = torch.tensor([[[[0.0, 0.0]], [[4.0, 4.0]]]])
+    visibility = torch.tensor([[[1.0], [0.0]]])
+    valid = torch.ones(b, t, n)
+
+    criterion = CowTrackerDenseLoss(invisible_coord_weight=0.0, use_huber=False)
+    out = criterion({"track": track, "vis": vis, "conf": conf}, gt, visibility, valid)
+    expected = (
+        criterion.coord_weight * out["coord_loss"]
+        + criterion.visibility_weight * out["visibility_loss"]
+        + criterion.confidence_weight * out["confidence_loss"]
+    )
+
+    assert out["invisible_coord_loss"] > 0
+    assert torch.allclose(out["loss"], expected)
 
 
 def test_select_aggregator_state_dict_accepts_full_or_direct_keys():

@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # Force using only the first GPU for visualization
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"  # Force using only the first GPU for visualization
 
 import argparse
 import json

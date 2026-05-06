@@ -15,12 +15,14 @@ Usage:
 
 import argparse
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Use only the first GPU for inference
 
 import mediapy
 import numpy as np
 import torch
 
 from cowtracker import CoWTracker
+from cowtracker import CoWTrackerWindowed
 from cowtracker.utils.visualization import paint_point_track
 
 inf_dtype = torch.float16
@@ -155,10 +157,15 @@ def main():
 
     # Load model
     print("\n[1/4] Loading model...")
-    model = CoWTracker.from_checkpoint(
+    # model = CoWTracker.from_checkpoint(
+    #     args.checkpoint,
+    #     device="cuda" if torch.cuda.is_available() else "cpu",
+    #     dtype=inf_dtype if torch.cuda.is_available() else torch.float32,
+    # )
+    model = CoWTrackerWindowed.from_checkpoint(
         args.checkpoint,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        dtype=inf_dtype if torch.cuda.is_available() else torch.float32,
+        device="cuda",
+        dtype=torch.float16,
     )
 
     # Load video

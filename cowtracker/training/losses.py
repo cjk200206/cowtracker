@@ -52,19 +52,23 @@ class CowTrackerDenseLoss(nn.Module):
     def __init__(
         self,
         coord_weight: float = 0.05,
+        invisible_coord_weight: float = 0.01,
         visibility_weight: float = 1.0,
         confidence_weight: float = 1.0,
         confidence_threshold: float = 12.0,
         iter_gamma: float = 0.8,
+        coord_loss_only_visible: bool = True,
         use_huber: bool = True,
         huber_delta: float = 6.0,
     ) -> None:
         super().__init__()
         self.coord_weight = float(coord_weight)
+        self.invisible_coord_weight = float(invisible_coord_weight)
         self.visibility_weight = float(visibility_weight)
         self.confidence_weight = float(confidence_weight)
         self.confidence_threshold = float(confidence_threshold)
         self.iter_gamma = float(iter_gamma)
+        self.coord_loss_only_visible = bool(coord_loss_only_visible)
         self.use_huber = bool(use_huber)
         self.huber_delta = float(huber_delta)
 
@@ -81,10 +85,13 @@ class CowTrackerDenseLoss(nn.Module):
         finite = torch.isfinite(gt_trajectory).all(dim=-1).float()
         valid = gt_valid * finite
         visible_valid = valid * gt_visibility
+        coord_valid = visible_valid if self.coord_loss_only_visible else valid
+        invisible_valid = valid * (1.0 - gt_visibility)
 
         dense_predictions = self._iter_prediction_triplets(predictions)
         n_iters = len(dense_predictions)
         coord_loss = gt_trajectory.new_zeros(())
+        invisible_coord_loss = gt_trajectory.new_zeros(())
         visibility_loss = gt_trajectory.new_zeros(())
         confidence_loss = gt_trajectory.new_zeros(())
 
@@ -98,24 +105,28 @@ class CowTrackerDenseLoss(nn.Module):
             pred_conf = sample_dense_predictions(conf[..., None], query_xy).squeeze(-1).clamp(1e-4, 1.0 - 1e-4)
             iter_weight = self.iter_gamma ** (n_iters - iter_idx - 1)
 
-            coord_i, vis_i, conf_i = self._compute_single_losses(
+            coord_i, invisible_coord_i, vis_i, conf_i = self._compute_single_losses(
                 pred_track,
                 pred_vis,
                 pred_conf,
                 gt_trajectory,
                 gt_visibility,
+                coord_valid,
+                invisible_valid,
                 valid,
                 visible_valid,
             )
 
             coord_loss = coord_loss + iter_weight * coord_i
-            visibility_loss = visibility_loss + iter_weight * vis_i
-            confidence_loss = confidence_loss + iter_weight * conf_i
+            invisible_coord_loss = invisible_coord_loss + iter_weight * invisible_coord_i
+            visibility_loss = visibility_loss + vis_i
+            confidence_loss = confidence_loss + conf_i
             sampled_tracks.append(pred_track)
             sampled_visibilities.append(pred_vis)
             sampled_confidences.append(pred_conf)
 
         coord_loss = coord_loss / n_iters
+        invisible_coord_loss = invisible_coord_loss / n_iters
         visibility_loss = visibility_loss / n_iters
         confidence_loss = confidence_loss / n_iters
 
@@ -125,6 +136,7 @@ class CowTrackerDenseLoss(nn.Module):
 
         loss = (
             self.coord_weight * coord_loss
+            + self.invisible_coord_weight * invisible_coord_loss
             + self.visibility_weight * visibility_loss
             + self.confidence_weight * confidence_loss
         )
@@ -136,9 +148,11 @@ class CowTrackerDenseLoss(nn.Module):
         return {
             "loss": loss,
             "coord_loss": coord_loss,
+            "invisible_coord_loss": invisible_coord_loss,
             "visibility_loss": visibility_loss,
             "confidence_loss": confidence_loss,
             "loss_coord": coord_loss,
+            "loss_invisible_coord": invisible_coord_loss,
             "loss_vis": visibility_loss,
             "loss_conf": confidence_loss,
             "final_epe": final_epe,
@@ -169,6 +183,8 @@ class CowTrackerDenseLoss(nn.Module):
         pred_conf: torch.Tensor,
         gt_trajectory: torch.Tensor,
         gt_visibility: torch.Tensor,
+        coord_valid: torch.Tensor,
+        invisible_valid: torch.Tensor,
         valid: torch.Tensor,
         visible_valid: torch.Tensor,
     ):
@@ -176,7 +192,10 @@ class CowTrackerDenseLoss(nn.Module):
             coord_elem = _huber_loss(pred_track, gt_trajectory, self.huber_delta).mean(dim=-1)
         else:
             coord_elem = (pred_track - gt_trajectory).abs().mean(dim=-1)
-        coord_loss = _masked_mean(coord_elem, visible_valid)
+        coord_loss = _masked_mean(coord_elem, coord_valid)
+
+        invisible_coord_elem = (pred_track - gt_trajectory).abs().mean(dim=-1)
+        invisible_coord_loss = _masked_mean(invisible_coord_elem, invisible_valid)
 
         with torch.autocast(device_type=pred_vis.device.type, enabled=False):
             vis_elem = F.binary_cross_entropy(
@@ -195,4 +214,4 @@ class CowTrackerDenseLoss(nn.Module):
                 reduction="none",
             )
         confidence_loss = _masked_mean(conf_elem, visible_valid)
-        return coord_loss, visibility_loss, confidence_loss
+        return coord_loss, invisible_coord_loss, visibility_loss, confidence_loss
