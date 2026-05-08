@@ -34,6 +34,7 @@ from scripts.train_cowtracker import (
     ensure_vggt_available,
     extract_state_dict,
     load_config,
+    model_uses_vggt,
     normalize_state_dict_keys,
 )
 
@@ -68,7 +69,10 @@ def parse_args():
     parser.add_argument("--linewidth", type=int, default=2)
     parser.add_argument("--tracks_leave_trace", type=int, default=-1)
     parser.add_argument("--show_first_frame", type=int, default=0)
+    # GT overlay mode: keep prediction tracks, and draw GT as red crosses.
     parser.add_argument("--draw_gt", action="store_true")
+    # GT-only mode: render GT tracks directly and skip checkpoint/model inference.
+    parser.add_argument("--gt_only", action="store_true")
     parser.add_argument("--save_npz", action="store_true")
     parser.add_argument("--random_temporal_crop", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
@@ -105,11 +109,13 @@ def build_visualization_model(
     window_len: int | None = None,
     window_stride: int | None = None,
 ):
-    ensure_vggt_available()
+    model_cfg_source = ckpt.get("config", cfg) if isinstance(ckpt, dict) else cfg
+    if model_uses_vggt(model_cfg_source):
+        ensure_vggt_available()
+
     from cowtracker.models.cowtracker import CoWTracker
     from cowtracker.models.cowtracker_online import CoWTrackerOnline
 
-    model_cfg_source = ckpt.get("config", cfg) if isinstance(ckpt, dict) else cfg
     model_kwargs = model_kwargs_from_config(model_cfg_source)
     if use_online:
         resolved_window_len = int(window_len or cfg.get("data", {}).get("seq_len", 8))
@@ -238,12 +244,11 @@ def main():
     set_seed(args.seed)
 
     cfg = load_config(args.config)
-    ckpt = load_checkpoint(args.checkpoint)
+
+    if args.gt_only and args.point_source != "gt":
+        raise ValueError("--gt_only requires --point_source gt.")
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    precision = args.precision or str(cfg.get("train", {}).get("precision", "bf16")).lower()
-    amp_dtype = autocast_dtype(precision)
-    use_amp = amp_dtype is not None and device.type == "cuda"
 
     seq_len_override = args.seq_len
     dataset = build_visualization_dataset(
@@ -262,28 +267,43 @@ def main():
     batch = move_batch_to_device(batch, device)
     input_frames = int(batch.video.shape[1])
 
-    use_online = bool(args.online or args.full_sequence or args.window_len is not None)
-    model = build_visualization_model(
-        ckpt,
-        cfg,
-        device,
-        use_online=use_online,
-        window_len=args.window_len,
-        window_stride=args.window_stride,
-    )
-    with torch.no_grad():
-        with torch.autocast(device_type=device.type, dtype=amp_dtype or torch.float32, enabled=use_amp):
-            predictions = model(batch.video, return_all_iters=False)
-
     if args.point_source == "gt":
         query_xy, gt_tracks, gt_visibility = select_gt_points(batch, args.num_points)
     else:
         query_xy, gt_tracks, gt_visibility = select_grid_points(batch, args.num_points)
 
-    pred_track, pred_vis, pred_conf = sample_sparse_predictions(predictions, query_xy)
-    pred_visibility = pred_vis > float(args.vis_threshold)
-    if args.conf_threshold is not None:
-        pred_visibility = pred_visibility & (pred_conf > float(args.conf_threshold))
+    use_online = bool(args.online or args.full_sequence or args.window_len is not None)
+    mode = "gt_only" if args.gt_only else "pred+optional_gt"
+    pred_track = None
+    pred_visibility = None
+    pred_conf = None
+    model = None
+
+    if args.gt_only:
+        # In gt_only mode, GT itself becomes the main rendered track source.
+        pred_track = gt_tracks
+        pred_visibility = gt_visibility
+    else:
+        ckpt = load_checkpoint(args.checkpoint)
+        precision = args.precision or str(cfg.get("train", {}).get("precision", "bf16")).lower()
+        amp_dtype = autocast_dtype(precision)
+        use_amp = amp_dtype is not None and device.type == "cuda"
+        model = build_visualization_model(
+            ckpt,
+            cfg,
+            device,
+            use_online=use_online,
+            window_len=args.window_len,
+            window_stride=args.window_stride,
+        )
+        with torch.no_grad():
+            with torch.autocast(device_type=device.type, dtype=amp_dtype or torch.float32, enabled=use_amp):
+                predictions = model(batch.video, return_all_iters=False)
+
+        pred_track, pred_vis, pred_conf = sample_sparse_predictions(predictions, query_xy)
+        pred_visibility = pred_vis > float(args.vis_threshold)
+        if args.conf_threshold is not None:
+            pred_visibility = pred_visibility & (pred_conf > float(args.conf_threshold))
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -302,17 +322,20 @@ def main():
         pred_visibility,
         filename=f"{stem}.mp4",
         query_frame=0,
-        gt_tracks=gt_tracks if args.draw_gt else None,
-        gt_visibility=gt_visibility if args.draw_gt else None,
+        # draw_gt overlays GT crosses on top of predictions; disabled in gt_only to avoid duplicate GT marks.
+        gt_tracks=gt_tracks if (args.draw_gt and not args.gt_only) else None,
+        gt_visibility=gt_visibility if (args.draw_gt and not args.gt_only) else None,
     )
 
     if args.save_npz:
-        arrays = {
-            "query_xy": query_xy.detach().cpu().numpy(),
-            "pred_track": pred_track.detach().cpu().numpy(),
-            "pred_visibility": pred_visibility.detach().cpu().numpy(),
-            "pred_confidence": pred_conf.detach().cpu().numpy(),
-        }
+        arrays = {"query_xy": query_xy.detach().cpu().numpy()}
+        if args.gt_only:
+            arrays["gt_track"] = gt_tracks.detach().cpu().numpy()
+            arrays["gt_visibility"] = gt_visibility.detach().cpu().numpy()
+        else:
+            arrays["pred_track"] = pred_track.detach().cpu().numpy()
+            arrays["pred_visibility"] = pred_visibility.detach().cpu().numpy()
+            arrays["pred_confidence"] = pred_conf.detach().cpu().numpy()
         if gt_tracks is not None:
             arrays["gt_track"] = gt_tracks.detach().cpu().numpy()
         if gt_visibility is not None:
@@ -323,12 +346,13 @@ def main():
     print(
         f"seq_name={seq_name} sample_index={resolved_index} "
         f"input_frames={input_frames} "
+        f"mode={mode} "
         f"show_first_frame={args.show_first_frame} "
         f"rendered_frames={rendered.shape[0]} "
         f"online={use_online} "
-        f"window_len={getattr(model, 'window_len', None)} "
-        f"window_stride={getattr(model, 'window_stride', None)} "
-        f"num_windows={len(getattr(model, 'last_windows', []))}",
+        f"window_len={getattr(model, 'window_len', None) if model is not None else None} "
+        f"window_stride={getattr(model, 'window_stride', None) if model is not None else None} "
+        f"num_windows={len(getattr(model, 'last_windows', [])) if model is not None else 0}",
         flush=True,
     )
     print(f"Rendered frames: {tuple(rendered.shape)}", flush=True)

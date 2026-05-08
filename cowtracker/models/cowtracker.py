@@ -10,10 +10,8 @@ import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
 
-import cowtracker.thirdparty  # noqa: F401 - sets up vggt path
-from vggt.models.aggregator import Aggregator
-from cowtracker.heads.feature_extractor import FeatureExtractor
 from cowtracker.heads.tracking_head import CowTrackingHead
+from cowtracker.layers.cotracker3_encoder import CoTracker3BasicEncoder
 
 
 class CoWTracker(nn.Module, PyTorchModelHubMixin):
@@ -37,49 +35,94 @@ class CoWTracker(nn.Module, PyTorchModelHubMixin):
 
     def __init__(
         self,
+        backbone_type: str = "vggt",
         features: int = 128,
         side_resnet_channels: int = 128,
         down_ratio: int = 2,
+        cotracker_backbone_stride: int = None,
         warp_iters: int = 5,
         warp_vit_num_blocks: int = None,
+        limit_flow: bool = False,
+        max_flow_update_ratio: float = 0.15,
+        max_flow_magnitude_ratio: float = 1.0,
     ):
         """
         Args:
+            backbone_type: "vggt" for the original VGGT+DPT path, or
+                "cotracker3" for a lightweight CoTracker3 BasicEncoder path.
             features: Number of DPT output features.
             side_resnet_channels: Number of ResNet side feature channels.
             down_ratio: Feature downsampling ratio.
+            cotracker_backbone_stride: Optional stride for the cotracker3
+                backbone. Defaults to down_ratio when unset.
             warp_iters: Number of Warping-based iterative refinement iterations.
             warp_vit_num_blocks: Number of transformer blocks (None = default).
+            limit_flow: If True, bound residual flow updates in the tracking head.
+            max_flow_update_ratio: Per-iteration flow update limit as a ratio of
+                the tracking feature map's longer side.
+            max_flow_magnitude_ratio: Accumulated flow limit as a ratio of the
+                tracking feature map's longer side.
         """
         super().__init__()
 
         print("Initializing CoWTracker...")
+        self.backbone_type = str(backbone_type).lower().strip()
+        if self.backbone_type not in {"vggt", "cotracker3"}:
+            raise ValueError("backbone_type must be one of: vggt, cotracker3")
 
-        # Backbone: VGGT backbone
-        self.aggregator = Aggregator(
-            img_size=self.IMG_SIZE,
-            patch_size=self.PATCH_SIZE,
-            embed_dim=self.EMBED_DIM,
-            patch_embed=self.PATCH_EMBED,
-            depth=self.DEPTH,
-        )
+        self.aggregator = None
+        self.feature_extractor = None
 
-        # High Resolution Feature extraction
-        self.feature_extractor = FeatureExtractor(
-            features=features,
-            down_ratio=down_ratio,
-            side_resnet_channels=side_resnet_channels,
-        )
+        if self.backbone_type == "vggt":
+            # Lazy imports keep the cotracker3 path independent from the VGGT submodule.
+            import cowtracker.thirdparty  # noqa: F401 - sets up vggt path
+            from vggt.models.aggregator import Aggregator
+            from cowtracker.heads.feature_extractor import FeatureExtractor
+
+            self.aggregator = Aggregator(
+                img_size=self.IMG_SIZE,
+                patch_size=self.PATCH_SIZE,
+                embed_dim=self.EMBED_DIM,
+                patch_embed=self.PATCH_EMBED,
+                depth=self.DEPTH,
+            )
+
+            self.feature_extractor = FeatureExtractor(
+                features=features,
+                down_ratio=down_ratio,
+                side_resnet_channels=side_resnet_channels,
+            )
+            tracking_feature_dim = self.feature_extractor.out_dim
+            tracking_down_ratio = down_ratio
+        else:
+            tracking_down_ratio = (
+                int(cotracker_backbone_stride)
+                if cotracker_backbone_stride is not None
+                else int(down_ratio)
+            )
+            self.feature_extractor = CoTracker3BasicEncoder(
+                input_dim=3,
+                output_dim=features,
+                stride=tracking_down_ratio,
+            )
+            tracking_feature_dim = features
 
         # Tracking head: warping-based iterative refinement
         self.tracking_head = CowTrackingHead(
-            feature_dim=self.feature_extractor.out_dim,
-            down_ratio=down_ratio,
+            feature_dim=tracking_feature_dim,
+            down_ratio=tracking_down_ratio,
             warp_iters=warp_iters,
             warp_vit_num_blocks=warp_vit_num_blocks,
+            limit_flow=limit_flow,
+            max_flow_update_ratio=max_flow_update_ratio,
+            max_flow_magnitude_ratio=max_flow_magnitude_ratio,
         )
 
-        print(f"  - Features: {features}, Side channels: {side_resnet_channels}")
+        print(f"  - Backbone: {self.backbone_type}")
+        if self.backbone_type == "vggt":
+            print(f"  - Features: {features}, Side channels: {side_resnet_channels}")
+        else:
+            print(f"  - Features: {features}, Encoder stride: {tracking_down_ratio}")
         print(f"  - Warping-based iterative refinement iterations: {warp_iters}")
 
     def forward(
@@ -110,11 +153,11 @@ class CoWTracker(nn.Module, PyTorchModelHubMixin):
 
         B, S, C, H, W = images.shape
 
-        # Extract backbone tokens
-        tokens, patch_idx = self.aggregator(images)
-
-        # Extract high resolution features
-        features = self.feature_extractor(tokens, images, patch_idx)
+        if self.backbone_type == "vggt":
+            tokens, patch_idx = self.aggregator(images)
+            features = self.feature_extractor(tokens, images, patch_idx)
+        else:
+            features = self.feature_extractor(images)
 
         # Run tracking
         predictions = self.tracking_head(
@@ -216,9 +259,19 @@ class CoWTracker(nn.Module, PyTorchModelHubMixin):
         Returns:
             Loaded model in eval mode.
         """
-        model = cls()
-
         ckpt = cls._load_checkpoint(checkpoint_path)
+        model_kwargs = {}
+        if isinstance(ckpt, dict) and isinstance(ckpt.get("config"), dict):
+            model_kwargs = dict(ckpt["config"].get("model", {}))
+            for key in (
+                "freeze_vggt",
+                "freeze_aggregator",
+                "freeze_feature_extractor",
+                "freeze_tracking_head",
+            ):
+                model_kwargs.pop(key, None)
+
+        model = cls(**model_kwargs)
         state_dict = ckpt.get("model", ckpt)
 
         # Remap legacy checkpoint keys if needed

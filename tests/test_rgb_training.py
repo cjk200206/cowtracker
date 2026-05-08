@@ -3,9 +3,24 @@ import torch
 from PIL import Image
 
 from cowtracker.datasets import RGBTapFormerDataset, cow_rgb_collate
+from cowtracker.heads.tracking_head import CowTrackingHead
+from cowtracker.layers.cotracker3_encoder import CoTracker3BasicEncoder
 from cowtracker.training.losses import CowTrackerDenseLoss, sample_dense_predictions
 from cowtracker.utils.visualization import TrackVisualizer
-from scripts.train_cowtracker import freeze_vggt_patch_embedding, select_aggregator_state_dict
+from scripts.train_cowtracker import (
+    freeze_vggt_patch_embedding,
+    model_uses_vggt,
+    select_aggregator_state_dict,
+)
+
+
+def _make_flow_update_head(limit_flow, update_ratio=0.15, magnitude_ratio=1.0):
+    head = CowTrackingHead.__new__(CowTrackingHead)
+    torch.nn.Module.__init__(head)
+    head.limit_flow = bool(limit_flow)
+    head.max_flow_update_ratio = float(update_ratio)
+    head.max_flow_magnitude_ratio = float(magnitude_ratio)
+    return head
 
 
 def _write_sample(root, num_frames=5, height=16, width=20, num_points=3):
@@ -90,6 +105,31 @@ def test_sample_dense_predictions_for_visualization():
     assert torch.allclose(sampled[:, :, 1], torch.tensor([[[5.0, 1.0], [5.0, 1.0]]]))
 
 
+def test_flow_limit_disabled_preserves_residual_update():
+    head = _make_flow_update_head(limit_flow=False)
+    flow = torch.ones(1, 2, 2, 4, 5)
+    raw_delta = torch.full_like(flow, 100.0)
+
+    updated = head._apply_flow_update(flow, raw_delta)
+
+    assert torch.equal(updated, flow + raw_delta)
+
+
+def test_flow_limit_bounds_update_and_total_magnitude():
+    head = _make_flow_update_head(limit_flow=True, update_ratio=0.1, magnitude_ratio=0.25)
+    flow = torch.zeros(1, 1, 2, 10, 20)
+    raw_delta = torch.full_like(flow, 1_000_000.0)
+
+    updated = head._apply_flow_update(flow, raw_delta)
+
+    assert updated.abs().max() <= 2.0 + 1e-5
+
+    near_limit_flow = torch.full_like(flow, 4.9)
+    updated_near_limit = head._apply_flow_update(near_limit_flow, raw_delta)
+
+    assert updated_near_limit.abs().max() <= 5.0 + 1e-5
+
+
 def test_track_visualizer_renders_cotracker_style_frames(tmp_path):
     video = torch.zeros(1, 3, 3, 16, 20)
     video[:, :, 0] = 64
@@ -114,6 +154,43 @@ def test_track_visualizer_renders_cotracker_style_frames(tmp_path):
     assert rendered.shape == (5, 16, 20, 3)
     assert rendered.dtype == np.uint8
     assert rendered.max() > 64
+
+
+def test_cotracker3_basic_encoder_outputs_video_features():
+    encoder = CoTracker3BasicEncoder(output_dim=32, stride=4)
+    video = torch.rand(1, 3, 3, 32, 40)
+
+    features = encoder(video)
+    norms = torch.linalg.vector_norm(features, dim=2)
+
+    assert features.shape == (1, 3, 32, 8, 10)
+    assert torch.isfinite(features).all()
+    assert torch.allclose(norms, torch.ones_like(norms), atol=1e-4)
+
+
+def test_cowtracker_cotracker3_backbone_skips_vggt_components():
+    import pytest
+
+    pytest.importorskip("timm")
+    from cowtracker.models.cowtracker import CoWTracker
+
+    model = CoWTracker(
+        backbone_type="cotracker3",
+        features=32,
+        down_ratio=4,
+        warp_iters=1,
+    )
+
+    assert model.backbone_type == "cotracker3"
+    assert model.aggregator is None
+    assert isinstance(model.feature_extractor, CoTracker3BasicEncoder)
+    assert model.tracking_head.down_ratio == 4
+
+
+def test_model_uses_vggt_reads_backbone_type():
+    assert model_uses_vggt({"model": {}})
+    assert model_uses_vggt({"model": {"backbone_type": "vggt"}})
+    assert not model_uses_vggt({"model": {"backbone_type": "cotracker3"}})
 
 
 def test_cowtracker_online_sliding_windows_use_first_frame_anchor():

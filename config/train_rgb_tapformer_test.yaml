@@ -20,6 +20,9 @@ model:
   warp_iters: 5
   # Keep null unless the DPT intermediate indices are changed with it.
   warp_vit_num_blocks: null
+  limit_flow: true
+  max_flow_update_ratio: 0.15
+  max_flow_magnitude_ratio: 1.0
   # VGGT aggregator can be initialized separately via train.vggt_checkpoint.
   # freeze_vggt=true freezes only VGGT patch-embedding layers; the rest of VGGT is finetuned.
   # freeze_aggregator=true freezes the whole VGGT aggregator, useful on 24GB GPUs.
@@ -41,6 +44,9 @@ train:
   epochs: 500
   max_steps: null
   lr: 0.0005
+  lr_scheduler: cosine
+  min_lr: 0.000001
+  warmup_steps: 0
   weight_decay: 0.0001
   grad_clip_norm: 1.0
   precision: bf16

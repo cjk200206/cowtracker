@@ -14,6 +14,7 @@ from cowtracker.layers.video_transformer import (
     replace_attention_with_flash3,
 )
 from cowtracker.layers.patch_embed import PatchEmbed
+from cowtracker.layers.cotracker3_encoder import CoTracker3BasicEncoder
 
 __all__ = [
     "TemporalSelfAttentionBlock",
@@ -22,5 +23,5 @@ __all__ = [
     "FlashAttention3",
     "replace_attention_with_flash3",
     "PatchEmbed",
+    "CoTracker3BasicEncoder",
 ]
-

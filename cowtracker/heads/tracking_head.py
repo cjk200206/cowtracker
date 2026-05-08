@@ -37,6 +37,9 @@ class CowTrackingHead(nn.Module):
         warp_iters: int = 5,
         warp_model: str = "vits",
         warp_vit_num_blocks: int = None,
+        limit_flow: bool = False,
+        max_flow_update_ratio: float = 0.15,
+        max_flow_magnitude_ratio: float = 1.0,
     ):
         """
         Args:
@@ -45,11 +48,24 @@ class CowTrackingHead(nn.Module):
             warp_iters: Number of Warping-based iterative refinement iterations.
             warp_model: Model configuration for video transformer.
             warp_vit_num_blocks: Number of transformer blocks (None = use default).
+            limit_flow: If True, bound each residual flow update and accumulated flow.
+            max_flow_update_ratio: Per-iteration flow update limit as a ratio of
+                the low-resolution feature map's longer side.
+            max_flow_magnitude_ratio: Accumulated flow limit as a ratio of the
+                low-resolution feature map's longer side.
         """
         super().__init__()
 
         self.warp_iters = warp_iters
         self.down_ratio = down_ratio
+        self.limit_flow = bool(limit_flow)
+        self.max_flow_update_ratio = float(max_flow_update_ratio)
+        self.max_flow_magnitude_ratio = float(max_flow_magnitude_ratio)
+        if self.limit_flow:
+            if self.max_flow_update_ratio <= 0.0:
+                raise ValueError("max_flow_update_ratio must be positive when limit_flow=True.")
+            if self.max_flow_magnitude_ratio <= 0.0:
+                raise ValueError("max_flow_magnitude_ratio must be positive when limit_flow=True.")
 
         # Warping-based iterative refinement iteration dimension
         self.iter_dim = MODEL_CONFIGS[warp_model]["features"]
@@ -164,7 +180,7 @@ class CowTrackingHead(nn.Module):
 
             # Predict flow and info update
             update = self.flow_head(net.view(B * S, -1, H, W)).view(B, S, 4, H, W)
-            flow = flow + update[:, :, :2]
+            flow = self._apply_flow_update(flow, update[:, :, :2])
             info = update[:, :, 2:]
 
             if return_all_iters:
@@ -192,6 +208,20 @@ class CowTrackingHead(nn.Module):
         if self.training and refine_inp.requires_grad:
             return checkpoint(refine_forward, refine_inp, use_reentrant=False)
         return refine_forward(refine_inp)
+
+    def _flow_limits(self, flow: torch.Tensor) -> tuple[float, float]:
+        longer_side = float(max(flow.shape[-2], flow.shape[-1]))
+        update_limit = longer_side * self.max_flow_update_ratio
+        total_limit = longer_side * self.max_flow_magnitude_ratio
+        return update_limit, total_limit
+
+    def _apply_flow_update(self, flow: torch.Tensor, raw_delta: torch.Tensor) -> torch.Tensor:
+        if not self.limit_flow:
+            return flow + raw_delta
+
+        update_limit, total_limit = self._flow_limits(flow)
+        delta = update_limit * torch.tanh(raw_delta / update_limit)
+        return (flow + delta).clamp(-total_limit, total_limit)
 
     def _format_predictions(
         self,

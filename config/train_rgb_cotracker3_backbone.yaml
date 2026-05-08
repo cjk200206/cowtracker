@@ -1,0 +1,67 @@
+data:
+  data_root: data/event_kubric
+  split: test
+  seq_len: 12
+  traj_per_sample: 256
+  crop_size: [448, 448]
+  frame_source: blur
+  use_augs: false
+  random_temporal_crop: true
+  choose_long_point: false
+
+model:
+  backbone_type: cotracker3
+  features: 128
+  down_ratio: 2
+  cotracker_backbone_stride: null
+  warp_iters: 5
+  warp_vit_num_blocks: null
+  limit_flow: true
+  max_flow_update_ratio: 0.15
+  max_flow_magnitude_ratio: 1.0
+  freeze_vggt: false
+  freeze_aggregator: false
+  freeze_feature_extractor: false
+  freeze_tracking_head: false
+
+train:
+  save_dir: output/train_rgb_cotracker3_backbone
+  batch_size: 1
+  num_workers: 8
+  shuffle: true
+  pin_memory: true
+  drop_last: true
+  epochs: 500
+  max_steps: null
+  lr: 0.0005
+  lr_scheduler: cosine
+  min_lr: 0.000001
+  warmup_steps: 0
+  weight_decay: 0.0001
+  grad_clip_norm: 1.0
+  precision: bf16
+  seed: 0
+  return_all_iters: true
+  log_every: 10
+  save_every_steps: 0
+  save_best: true
+  save_last: true
+  best_metric: loss
+  best_mode: min
+  init_checkpoint: null
+  init_from_hf: false
+  init_strict: false
+  vggt_checkpoint: null
+  vggt_strict: false
+  resume: null
+
+loss:
+  coord_weight: 0.05
+  invisible_coord_weight: 0.01
+  visibility_weight: 1.0
+  confidence_weight: 1.0
+  confidence_threshold: 12.0
+  iter_gamma: 0.8
+  coord_loss_only_visible: true
+  use_huber: true
+  huber_delta: 6.0

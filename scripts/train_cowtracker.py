@@ -9,13 +9,14 @@
 
 from __future__ import annotations
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"  # Force using only the first GPU for visualization
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1")
 
 import argparse
 import json
 import math
 import random
 import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -62,8 +63,8 @@ def metric_is_better(current: float, best: float, mode: str) -> bool:
     raise ValueError("best_mode must be one of: min, max")
 
 
-def checkpoint_state(model, optimizer, cfg, epoch, global_step, best_metric, best_epoch):
-    return {
+def checkpoint_state(model, optimizer, scheduler, cfg, epoch, global_step, best_metric, best_epoch):
+    state = {
         "epoch": epoch,
         "global_step": global_step,
         "model": model.state_dict(),
@@ -72,6 +73,9 @@ def checkpoint_state(model, optimizer, cfg, epoch, global_step, best_metric, bes
         "best_metric": best_metric,
         "best_epoch": best_epoch,
     }
+    if scheduler is not None:
+        state["scheduler"] = scheduler.state_dict()
+    return state
 
 
 def extract_state_dict(ckpt):
@@ -195,20 +199,35 @@ def ensure_vggt_available():
         )
 
 
-def build_model(cfg, device):
-    ensure_vggt_available()
-    from cowtracker.models.cowtracker import CoWTracker
+def model_uses_vggt(cfg):
+    model_cfg = cfg.get("model", {})
+    return str(model_cfg.get("backbone_type", "vggt")).lower().strip() == "vggt"
 
+
+def build_model(cfg, device):
     model_cfg = dict(cfg.get("model", {}))
     freeze_aggregator = bool(model_cfg.pop("freeze_aggregator", False))
     freeze_vggt = bool(model_cfg.pop("freeze_vggt", True))
     freeze_feature_extractor = bool(model_cfg.pop("freeze_feature_extractor", False))
     freeze_tracking_head = bool(model_cfg.pop("freeze_tracking_head", False))
+    uses_vggt = str(model_cfg.get("backbone_type", "vggt")).lower().strip() == "vggt"
+    if uses_vggt:
+        ensure_vggt_available()
+
+    from cowtracker.models.cowtracker import CoWTracker
+
     model = CoWTracker(**model_cfg).to(device)
 
     train_cfg = cfg.get("train", {})
     init_checkpoint = train_cfg.get("init_checkpoint")
     init_from_hf = bool(train_cfg.get("init_from_hf", True))
+    if not uses_vggt and init_from_hf:
+        print(
+            "Warning: init_from_hf is ignored for backbone_type='cotracker3' because "
+            "the default HF checkpoint is a VGGT-backed CoWTracker model.",
+            flush=True,
+        )
+        init_from_hf = False
     if init_checkpoint or init_from_hf:
         ckpt = CoWTracker._load_checkpoint(init_checkpoint)
         state_dict = extract_state_dict(ckpt)
@@ -228,7 +247,19 @@ def build_model(cfg, device):
         )
 
     vggt_checkpoint = train_cfg.get("vggt_checkpoint")
-    if vggt_checkpoint:
+    if not uses_vggt:
+        if vggt_checkpoint:
+            print(
+                "Warning: vggt_checkpoint is ignored for backbone_type='cotracker3'.",
+                flush=True,
+            )
+        if freeze_aggregator or freeze_vggt:
+            print(
+                "Warning: freeze_vggt/freeze_aggregator are ignored for "
+                "backbone_type='cotracker3'.",
+                flush=True,
+            )
+    elif vggt_checkpoint:
         if init_checkpoint or init_from_hf:
             print(
                 "vggt_checkpoint is set; its aggregator weights will override aggregator "
@@ -247,18 +278,18 @@ def build_model(cfg, device):
             flush=True,
         )
 
-    if freeze_aggregator:
+    if uses_vggt and freeze_aggregator:
         for p in model.aggregator.parameters():
             p.requires_grad = False
         print("VGGT aggregator frozen.", flush=True)
-    elif freeze_vggt:
+    elif uses_vggt and freeze_vggt:
         frozen = freeze_vggt_patch_embedding(model)
         print(
             "VGGT patch-embedding layers frozen; the rest of the VGGT backbone "
             f"remains trainable. Frozen parameters: {frozen:,}",
             flush=True,
         )
-    else:
+    elif uses_vggt:
         print("VGGT backbone fully trainable.", flush=True)
     if freeze_feature_extractor:
         for p in model.feature_extractor.parameters():
@@ -276,11 +307,11 @@ def build_model(cfg, device):
 
 def set_frozen_modules_eval(model, cfg):
     model_cfg = cfg.get("model", {})
-    if bool(model_cfg.get("freeze_aggregator", False)):
+    if model_uses_vggt(cfg) and bool(model_cfg.get("freeze_aggregator", False)):
         model.aggregator.eval()
-    elif bool(model_cfg.get("freeze_vggt", True)):
+    elif model_uses_vggt(cfg) and bool(model_cfg.get("freeze_vggt", True)):
         set_vggt_patch_embedding_eval(model)
-    if bool(model_cfg.get("freeze_feature_extractor", False)):
+    if bool(model_cfg.get("freeze_feature_extractor", False)) and model.feature_extractor is not None:
         model.feature_extractor.eval()
     if bool(model_cfg.get("freeze_tracking_head", False)):
         model.tracking_head.eval()
@@ -303,6 +334,62 @@ def autocast_dtype(precision: str):
     if precision in {"fp32", "32", "float32", "none"}:
         return None
     raise ValueError("precision must be one of: bf16, fp16, fp32")
+
+
+def build_lr_scheduler(optimizer, train_cfg, total_steps: int, last_epoch: int = -1):
+    scheduler_name = str(train_cfg.get("lr_scheduler", "") or "").lower().strip()
+    if scheduler_name in {"", "none", "null"}:
+        return None
+    if scheduler_name != "cosine":
+        raise ValueError("lr_scheduler must be one of: cosine, none")
+
+    base_lr = float(train_cfg.get("lr", 5e-4))
+    min_lr = float(train_cfg.get("min_lr", 1e-6))
+    warmup_steps = max(0, int(train_cfg.get("warmup_steps", 0)))
+    total_steps = max(1, int(total_steps))
+
+    for group in optimizer.param_groups:
+        group["initial_lr"] = float(group.get("initial_lr", base_lr))
+
+    if warmup_steps <= 0:
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=total_steps,
+            eta_min=min_lr,
+            last_epoch=last_epoch,
+        )
+
+    warmup_steps = min(warmup_steps, total_steps)
+    warmup_start_factor = max(min_lr / max(base_lr, 1e-12), 1e-8)
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=warmup_start_factor,
+        end_factor=1.0,
+        total_iters=warmup_steps,
+    )
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, total_steps - warmup_steps),
+        eta_min=min_lr,
+    )
+    return torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup, cosine],
+        milestones=[warmup_steps],
+        last_epoch=last_epoch,
+    )
+
+
+def advance_lr_scheduler(scheduler, steps: int) -> None:
+    if scheduler is None or steps <= 0:
+        return
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Detected call of `lr_scheduler.step\\(\\)` before `optimizer.step\\(\\)`",
+        )
+        for _ in range(int(steps)):
+            scheduler.step()
 
 
 def main():
@@ -357,6 +444,7 @@ def main():
     start_epoch = 0
     global_step = 0
     best_epoch = -1
+    scheduler_state = None
     best_mode = str(train_cfg.get("best_mode", "min")).lower()
     best_metric_name = str(train_cfg.get("best_metric", "loss"))
     best_metric = math.inf if best_mode == "min" else -math.inf
@@ -368,6 +456,7 @@ def main():
             optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = int(ckpt.get("epoch", -1)) + 1
         global_step = int(ckpt.get("global_step", 0))
+        scheduler_state = ckpt.get("scheduler")
         best_metric = float(ckpt.get("best_metric", best_metric))
         best_epoch = int(ckpt.get("best_epoch", best_epoch))
         print(f"Resumed from {resume_path} at epoch={start_epoch}, step={global_step}", flush=True)
@@ -381,6 +470,17 @@ def main():
     log_every = int(train_cfg.get("log_every", 10))
     save_every_steps = int(train_cfg.get("save_every_steps", 1000))
     return_all_iters = bool(train_cfg.get("return_all_iters", False))
+    total_steps = max_steps if max_steps is not None else int(train_cfg.get("epochs", 40)) * len(loader)
+    scheduler = build_lr_scheduler(optimizer, train_cfg, total_steps)
+    if scheduler is not None and scheduler_state is not None:
+        scheduler.load_state_dict(scheduler_state)
+    elif scheduler is not None and resume_path and global_step > 0:
+        advance_lr_scheduler(scheduler, global_step)
+        print(
+            "Resume checkpoint has no scheduler state; aligned LR scheduler "
+            f"from global_step={global_step}.",
+            flush=True,
+        )
 
     if args.dry_run_model:
         batch, gotit = next(iter(loader))
@@ -434,12 +534,17 @@ def main():
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                scale_before_step = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
+                if scheduler is not None and scaler.get_scale() >= scale_before_step:
+                    scheduler.step()
             else:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
 
             global_step += 1
             steps_this_epoch += 1
@@ -454,13 +559,14 @@ def main():
                     f"loss_coord={running['loss_coord']/denom:.4f} "
                     f"loss_vis={running['loss_vis']/denom:.4f} "
                     f"loss_conf={running['loss_conf']/denom:.4f} "
-                    f"epe={running['final_epe']/denom:.4f}",
+                    f"epe={running['final_epe']/denom:.4f} "
+                    f"lr={optimizer.param_groups[0]['lr']:.2e}",
                     flush=True,
                 )
 
             if save_every_steps > 0 and global_step % save_every_steps == 0:
                 torch.save(
-                    checkpoint_state(model, optimizer, cfg, epoch, global_step, best_metric, best_epoch),
+                    checkpoint_state(model, optimizer, scheduler, cfg, epoch, global_step, best_metric, best_epoch),
                     save_dir / f"step_{global_step:07d}.pth",
                 )
 
@@ -474,7 +580,7 @@ def main():
                 best_metric = current
                 best_epoch = epoch
                 torch.save(
-                    checkpoint_state(model, optimizer, cfg, epoch, global_step, best_metric, best_epoch),
+                    checkpoint_state(model, optimizer, scheduler, cfg, epoch, global_step, best_metric, best_epoch),
                     save_dir / "best.pth",
                 )
                 print(f"[Best] epoch={epoch} {best_metric_name}={best_metric:.4f}", flush=True)
@@ -492,7 +598,7 @@ def main():
     if bool(train_cfg.get("save_last", True)):
         final_epoch = max(start_epoch, last_epoch)
         torch.save(
-            checkpoint_state(model, optimizer, cfg, final_epoch, global_step, best_metric, best_epoch),
+            checkpoint_state(model, optimizer, scheduler, cfg, final_epoch, global_step, best_metric, best_epoch),
             save_dir / "final.pth",
         )
         torch.save(model.state_dict(), save_dir / "final_model_weights.pth")
