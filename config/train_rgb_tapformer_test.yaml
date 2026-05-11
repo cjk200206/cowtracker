@@ -30,6 +30,7 @@ model:
   freeze_aggregator: true
   freeze_feature_extractor: false
   freeze_tracking_head: false
+  dpt_checkpoint: true
 
 train:
   # Formal training/model dry runs require cowtracker/thirdparty/vggt.
@@ -41,7 +42,7 @@ train:
   shuffle: true
   pin_memory: true
   drop_last: true
-  epochs: 500
+  epochs: 200
   max_steps: null
   lr: 0.0005
   lr_scheduler: cosine

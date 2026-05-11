@@ -176,6 +176,11 @@ class CowTrackerDenseLoss(nn.Module):
                 return triplets
         return [(predictions["track"], predictions["vis"], predictions["conf"])]
 
+    def _coord_error(self, pred_track: torch.Tensor, gt_trajectory: torch.Tensor) -> torch.Tensor:
+        if self.use_huber:
+            return _huber_loss(pred_track, gt_trajectory, self.huber_delta).mean(dim=-1)
+        return (pred_track - gt_trajectory).abs().mean(dim=-1)
+
     def _compute_single_losses(
         self,
         pred_track: torch.Tensor,
@@ -188,13 +193,10 @@ class CowTrackerDenseLoss(nn.Module):
         valid: torch.Tensor,
         visible_valid: torch.Tensor,
     ):
-        if self.use_huber:
-            coord_elem = _huber_loss(pred_track, gt_trajectory, self.huber_delta).mean(dim=-1)
-        else:
-            coord_elem = (pred_track - gt_trajectory).abs().mean(dim=-1)
+        coord_elem = self._coord_error(pred_track, gt_trajectory)
         coord_loss = _masked_mean(coord_elem, coord_valid)
 
-        invisible_coord_elem = (pred_track - gt_trajectory).abs().mean(dim=-1)
+        invisible_coord_elem = self._coord_error(pred_track, gt_trajectory)
         invisible_coord_loss = _masked_mean(invisible_coord_elem, invisible_valid)
 
         with torch.autocast(device_type=pred_vis.device.type, enabled=False):

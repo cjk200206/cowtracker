@@ -193,45 +193,69 @@ def test_model_uses_vggt_reads_backbone_type():
     assert not model_uses_vggt({"model": {"backbone_type": "cotracker3"}})
 
 
-def test_cowtracker_online_sliding_windows_use_first_frame_anchor():
+def test_cowtracker_online_sliding_windows_use_memory_and_windowed_merge():
+    from cowtracker.inference.windowed import WindowedInference
     from cowtracker.models.cowtracker_online import CoWTrackerOnline
+
+    class TinyTrackingHead(torch.nn.Module):
+        def __init__(self, owner):
+            super().__init__()
+            object.__setattr__(self, "owner", owner)
+
+        def forward(self, features, image_size, first_frame_features=None, return_all_iters=False):
+            del image_size, return_all_iters
+            first_value = first_frame_features[:, :, 0, 0, 0].detach().cpu().tolist()[0]
+            feature_values = features[:, :, 0, 0, 0].detach().cpu().tolist()[0]
+            self.owner.calls.append(first_value + feature_values)
+            call_offset = 100 * (len(self.owner.calls) - 1)
+
+            b, t, _, h, w = features.shape
+            frame_values = features[:, :, 0, 0, 0].view(b, t, 1, 1) + call_offset
+            track = features.new_zeros((b, t, h, w, 2))
+            track[..., 0] = frame_values
+            return {
+                "track": track,
+                "vis": features.new_ones((b, t, h, w)),
+                "conf": features.new_ones((b, t, h, w)),
+            }
 
     class TinyOnline(CoWTrackerOnline):
         def __init__(self):
             torch.nn.Module.__init__(self)
             self.window_len = 4
             self.window_stride = 2
+            self.num_memory_frames = 10
             self.merge_mode = "overwrite"
+            self.windowed = WindowedInference(
+                window_len=self.window_len,
+                stride=self.window_stride,
+                num_memory_frames=self.num_memory_frames,
+            )
             self.last_windows = []
             self.calls = []
+            self.backbone_type = "cotracker3"
+            self.tracking_head = TinyTrackingHead(self)
 
-        def _forward_window_video(self, video, queries=None, return_all_iters=False):
-            del queries, return_all_iters
-            self.calls.append(video[:, :, 0, 0, 0].detach().cpu().tolist()[0])
-            b, t, _, h, w = video.shape
-            frame_values = video[:, :, 0, 0, 0].view(b, t, 1, 1)
-            track = video.new_zeros((b, t, h, w, 2))
-            track[..., 0] = frame_values
-            return {
-                "track": track,
-                "vis": video.new_ones((b, t, h, w)),
-                "conf": video.new_ones((b, t, h, w)),
-            }
+        def _extract_window_features(self, frames):
+            return frames
 
     model = TinyOnline().eval()
-    video = torch.arange(10).view(1, 10, 1, 1, 1).repeat(1, 1, 3, 2, 2).float()
+    video = (torch.arange(10) * 255).view(1, 10, 1, 1, 1).repeat(1, 1, 3, 2, 2).float()
 
     out = model(video)
 
     assert model.last_windows == [(0, 4), (2, 6), (4, 8), (6, 10)]
     assert model.calls == [
-        [0.0, 1.0, 2.0, 3.0],
-        [0.0, 2.0, 3.0, 4.0, 5.0],
-        [0.0, 4.0, 5.0, 6.0, 7.0],
-        [0.0, 6.0, 7.0, 8.0, 9.0],
+        [0.0, 0.0, 1.0, 2.0, 3.0],
+        [0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+        [0.0, 0.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+        [0.0, 0.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
     ]
     assert out["track"].shape == (1, 10, 2, 2, 2)
-    assert torch.equal(out["track"][0, :, 0, 0, 0], torch.arange(10).float())
+    assert torch.equal(
+        out["track"][0, :, 0, 0, 0],
+        torch.tensor([0.0, 1.0, 2.0, 3.0, 104.0, 105.0, 206.0, 207.0, 308.0, 309.0]),
+    )
 
 
 def test_cowtracker_online_short_video_uses_single_window():
@@ -264,6 +288,79 @@ def test_cowtracker_online_short_video_uses_single_window():
     assert model.last_windows == [(0, 3)]
     assert model.calls == 1
     assert out["track"].shape[1] == 3
+
+
+def test_cowtracker_online_windowed_path_supports_cotracker3_and_iters():
+    from cowtracker.inference.windowed import WindowedInference
+    from cowtracker.models.cowtracker_online import CoWTrackerOnline
+
+    class FailingAggregator:
+        def __call__(self, *args, **kwargs):
+            raise AssertionError("cotracker3 online path must not call aggregator")
+
+    class TinyFeatureExtractor(torch.nn.Module):
+        def forward(self, frames):
+            return frames
+
+    class TinyTrackingHead(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, features, image_size, first_frame_features=None, return_all_iters=False):
+            del image_size
+            assert first_frame_features[:, :, 0, 0, 0].eq(0).all()
+            self.calls += 1
+            b, t, _, h, w = features.shape
+            values = features[:, :, 0, 0, 0].view(b, t, 1, 1) + 100 * (self.calls - 1)
+            track = features.new_zeros((b, t, h, w, 2))
+            track[..., 0] = values
+            pred = {
+                "track": track,
+                "vis": features.new_ones((b, t, h, w)),
+                "conf": features.new_ones((b, t, h, w)),
+            }
+            if return_all_iters:
+                pred["track_iters"] = [track + 10, track + 20]
+                pred["vis_iters"] = [pred["vis"], pred["vis"]]
+                pred["conf_iters"] = [pred["conf"], pred["conf"]]
+            return pred
+
+    class TinyOnline(CoWTrackerOnline):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.window_len = 4
+            self.window_stride = 2
+            self.num_memory_frames = 10
+            self.merge_mode = "overwrite"
+            self.windowed = WindowedInference(
+                window_len=self.window_len,
+                stride=self.window_stride,
+                num_memory_frames=self.num_memory_frames,
+            )
+            self.last_windows = []
+            self.backbone_type = "cotracker3"
+            self.aggregator = FailingAggregator()
+            self.feature_extractor = TinyFeatureExtractor()
+            self.tracking_head = TinyTrackingHead()
+
+    model = TinyOnline().eval()
+    video = (torch.arange(6) * 255).view(1, 6, 1, 1, 1).repeat(1, 1, 3, 2, 2).float()
+
+    out = model(video, return_all_iters=True)
+
+    assert model.last_windows == [(0, 4), (2, 6)]
+    assert out["track_iters"][0].shape == (1, 6, 2, 2, 2)
+    assert out["vis_iters"][0].shape == (1, 6, 2, 2)
+    assert out["conf_iters"][0].shape == (1, 6, 2, 2)
+    assert torch.equal(
+        out["track"][0, :, 0, 0, 0],
+        torch.tensor([0.0, 1.0, 2.0, 3.0, 104.0, 105.0]),
+    )
+    assert torch.equal(
+        out["track_iters"][1][0, :, 0, 0, 0],
+        torch.tensor([20.0, 21.0, 22.0, 23.0, 124.0, 125.0]),
+    )
 
 
 def test_dense_loss_supports_iteration_predictions():

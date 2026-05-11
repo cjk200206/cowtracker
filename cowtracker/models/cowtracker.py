@@ -45,6 +45,7 @@ class CoWTracker(nn.Module, PyTorchModelHubMixin):
         limit_flow: bool = False,
         max_flow_update_ratio: float = 0.15,
         max_flow_magnitude_ratio: float = 1.0,
+        dpt_checkpoint: bool = False,
     ):
         """
         Args:
@@ -62,6 +63,7 @@ class CoWTracker(nn.Module, PyTorchModelHubMixin):
                 the tracking feature map's longer side.
             max_flow_magnitude_ratio: Accumulated flow limit as a ratio of the
                 tracking feature map's longer side.
+            dpt_checkpoint: Enable gradient checkpointing for the VGGT DPT head.
         """
         super().__init__()
 
@@ -91,6 +93,7 @@ class CoWTracker(nn.Module, PyTorchModelHubMixin):
                 features=features,
                 down_ratio=down_ratio,
                 side_resnet_channels=side_resnet_channels,
+                dpt_checkpoint=dpt_checkpoint,
             )
             tracking_feature_dim = self.feature_extractor.out_dim
             tracking_down_ratio = down_ratio

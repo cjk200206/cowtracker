@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import torch
 
+from cowtracker.inference.windowed import WindowedInference
 from cowtracker.models.cowtracker import CoWTracker
 
 
@@ -22,17 +23,19 @@ FREEZE_CONFIG_KEYS = {
 
 
 class CoWTrackerOnline(CoWTracker):
-    """CoWTracker with TAPFormer-style first-frame anchored sliding windows.
+    """CoWTracker with first-frame anchored windowed inference.
 
-    This class inherits the regular CoWTracker modules directly. For windows
-    after the first one, it prepends global frame 0 as the anchor and writes the
-    non-anchor predictions back into the full sequence output.
+    This class inherits the regular CoWTracker modules directly. Long videos are
+    processed as first-frame anchored windows with additional memory frames,
+    matching the standalone CoWTrackerWindowed strategy while preserving the
+    regular CoWTracker checkpoint layout.
     """
 
     def __init__(
         self,
         window_len: int = 8,
         window_stride: int | None = None,
+        num_memory_frames: int = 10,
         merge_mode: str = "overwrite",
         **cow_tracker_kwargs,
     ) -> None:
@@ -40,6 +43,7 @@ class CoWTrackerOnline(CoWTracker):
         resolved_window_stride = (
             int(window_stride) if window_stride is not None else max(1, resolved_window_len // 2)
         )
+        resolved_num_memory_frames = int(num_memory_frames)
         resolved_merge_mode = str(merge_mode).lower().strip()
 
         if resolved_window_len <= 0:
@@ -48,18 +52,26 @@ class CoWTrackerOnline(CoWTracker):
             raise ValueError("window_stride must be a positive integer.")
         if resolved_window_stride > resolved_window_len:
             raise ValueError("window_stride must be <= window_len to avoid temporal gaps.")
+        if resolved_num_memory_frames < 0:
+            raise ValueError("num_memory_frames must be non-negative.")
         if resolved_merge_mode != "overwrite":
             raise ValueError("Only merge_mode='overwrite' is supported for now.")
 
         super().__init__(**cow_tracker_kwargs)
         self.window_len = resolved_window_len
         self.window_stride = resolved_window_stride
+        self.num_memory_frames = resolved_num_memory_frames
         self.merge_mode = resolved_merge_mode
+        self.windowed = WindowedInference(
+            window_len=self.window_len,
+            stride=self.window_stride,
+            num_memory_frames=self.num_memory_frames,
+        )
         self.last_windows: list[tuple[int, int]] = []
         print(
             "CoWTrackerOnline initialized: "
             f"window_len={self.window_len}, window_stride={self.window_stride}, "
-            f"merge_mode={self.merge_mode}"
+            f"num_memory_frames={self.num_memory_frames}, merge_mode={self.merge_mode}"
         )
 
     def forward(
@@ -81,29 +93,42 @@ class CoWTrackerOnline(CoWTracker):
         windows = self.compute_windows(total_frames)
         self.last_windows = windows
 
+        images = video / 255.0
+        first_frame = images[:, 0:1]
         accumulated = None
         iter_accumulated = None
         for window_idx, (start, end) in enumerate(windows):
-            if window_idx == 0:
-                window_video = video[:, start:end]
-                output_offset = 0
-            else:
-                window_video = torch.cat([video[:, 0:1], video[:, start:end]], dim=1)
-                output_offset = 1
+            memory_indices = self.windowed.select_memory_frames(window_idx, start)
+            frame_parts = [first_frame]
+            if memory_indices:
+                frame_parts.append(images[:, memory_indices])
+            frame_parts.append(images[:, start:end])
+            frames = torch.cat(frame_parts, dim=1)
 
             if not self.training:
                 print(
                     f"Processing online window {window_idx + 1}/{len(windows)}: "
                     f"frames [{start}, {end})"
                 )
+                if memory_indices:
+                    print(f"  Memory frames: {memory_indices}")
 
-            pred = self._forward_window_video(
-                window_video,
-                queries=queries,
+            features = self._extract_window_features(frames)
+            first_frame_features = features[:, 0:1]
+            num_memory = len(memory_indices)
+            pred = self.tracking_head(
+                features[:, 1:],
+                image_size=(height, width),
+                first_frame_features=first_frame_features,
                 return_all_iters=return_all_iters,
             )
+            window_pred = {
+                "track": pred["track"][:, num_memory:],
+                "vis": pred["vis"][:, num_memory:],
+                "conf": pred["conf"][:, num_memory:],
+            }
             if accumulated is None:
-                accumulated = self._init_accumulated(pred, b, total_frames, height, width)
+                accumulated = self._init_accumulated(window_pred, b, total_frames, height, width)
                 if return_all_iters and "track_iters" in pred:
                     iter_accumulated = self._init_iter_accumulated(
                         pred,
@@ -113,24 +138,17 @@ class CoWTrackerOnline(CoWTracker):
                         width,
                     )
 
-            self._write_window_predictions(
-                accumulated,
-                pred,
-                start=start,
-                end=end,
-                output_offset=output_offset,
-            )
+            self.windowed.merge_predictions(window_idx, start, end, window_pred, accumulated)
             if iter_accumulated is not None:
-                self._write_window_iter_predictions(
-                    iter_accumulated,
-                    pred,
-                    start=start,
-                    end=end,
-                    output_offset=output_offset,
-                )
+                window_iter_pred = {
+                    "track_iters": [track[:, num_memory:] for track in pred["track_iters"]],
+                    "vis_iters": [vis[:, num_memory:] for vis in pred["vis_iters"]],
+                    "conf_iters": [conf[:, num_memory:] for conf in pred["conf_iters"]],
+                }
+                self._merge_window_iter_predictions(window_idx, start, end, window_iter_pred, iter_accumulated)
 
             if not self.training and torch.cuda.is_available():
-                del pred
+                del features, pred
                 torch.cuda.empty_cache()
 
         if iter_accumulated is not None:
@@ -149,19 +167,14 @@ class CoWTrackerOnline(CoWTracker):
     ) -> dict:
         return super().forward(video, queries=queries, return_all_iters=return_all_iters)
 
-    def compute_windows(self, total_frames: int) -> list[tuple[int, int]]:
-        if total_frames <= self.window_len:
-            return [(0, total_frames)]
+    def _extract_window_features(self, frames: torch.Tensor) -> torch.Tensor:
+        if self.backbone_type == "vggt":
+            tokens, patch_idx = self.aggregator(frames)
+            return self.feature_extractor(tokens, frames, patch_idx)
+        return self.feature_extractor(frames)
 
-        windows = []
-        start = 0
-        while start < total_frames:
-            end = min(start + self.window_len, total_frames)
-            windows.append((start, end))
-            if end == total_frames:
-                break
-            start += self.window_stride
-        return windows
+    def compute_windows(self, total_frames: int) -> list[tuple[int, int]]:
+        return self.windowed.compute_windows(total_frames)
 
     @staticmethod
     def _init_accumulated(
@@ -200,30 +213,25 @@ class CoWTrackerOnline(CoWTracker):
             ],
         }
 
-    @staticmethod
-    def _write_window_predictions(
+    def _merge_window_iter_predictions(
+        self,
+        window_idx: int,
+        window_start: int,
+        window_end: int,
+        window_pred: dict,
         accumulated: dict,
-        pred: dict,
-        start: int,
-        end: int,
-        output_offset: int,
     ) -> None:
-        write_len = end - start
-        for key in ("track", "vis", "conf"):
-            accumulated[key][:, start:end] = pred[key][:, output_offset : output_offset + write_len]
+        window_len = window_end - window_start
+        start_offset = 0
+        if window_idx > 0 and self.window_stride < self.window_len:
+            overlap_len = min(self.window_len - self.window_stride, window_len)
+            if overlap_len >= window_len:
+                return
+            start_offset = overlap_len
 
-    @staticmethod
-    def _write_window_iter_predictions(
-        accumulated: dict,
-        pred: dict,
-        start: int,
-        end: int,
-        output_offset: int,
-    ) -> None:
-        write_len = end - start
         for key in ("track_iters", "vis_iters", "conf_iters"):
-            for dst, src in zip(accumulated[key], pred[key]):
-                dst[:, start:end] = src[:, output_offset : output_offset + write_len]
+            for dst, src in zip(accumulated[key], window_pred[key]):
+                dst[:, window_start + start_offset : window_end] = src[:, start_offset:window_len]
 
     @classmethod
     def from_checkpoint(
@@ -231,6 +239,7 @@ class CoWTrackerOnline(CoWTracker):
         checkpoint_path: str = None,
         window_len: int = 8,
         window_stride: int | None = None,
+        num_memory_frames: int = 10,
         merge_mode: str = "overwrite",
         device: str = "cuda",
         dtype=torch.bfloat16,
@@ -247,6 +256,7 @@ class CoWTrackerOnline(CoWTracker):
         model = cls(
             window_len=window_len,
             window_stride=window_stride,
+            num_memory_frames=num_memory_frames,
             merge_mode=merge_mode,
             **model_kwargs,
         )

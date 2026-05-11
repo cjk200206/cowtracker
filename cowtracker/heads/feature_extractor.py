@@ -9,6 +9,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 import cowtracker.thirdparty  # noqa: F401 - sets up vggt path
 from vggt.heads.dpt_head import DPTHead
@@ -32,17 +33,20 @@ class FeatureExtractor(nn.Module):
         features: int = 128,
         down_ratio: int = 2,
         side_resnet_channels: int = 128,
+        dpt_checkpoint: bool = False,
     ):
         """
         Args:
             features: Number of DPT output features.
             down_ratio: Downsampling ratio relative to input image.
             side_resnet_channels: Number of ResNet side feature channels.
+            dpt_checkpoint: Enable gradient checkpointing for the DPT head.
         """
         super().__init__()
 
         self.features = features
         self.down_ratio = down_ratio
+        self.dpt_checkpoint = bool(dpt_checkpoint)
 
         # DPT head for backbone features
         self.dpt_head = DPTHead(
@@ -80,7 +84,17 @@ class FeatureExtractor(nn.Module):
         B, S, _, H_img, W_img = images.shape
 
         # DPT features from backbone tokens
-        backbone_features = self.dpt_head(aggregated_tokens_list, images, patch_start_idx)
+        if self.training and self.dpt_checkpoint:
+            def dpt_forward(*tokens):
+                return self.dpt_head(list(tokens), images, patch_start_idx)
+
+            backbone_features = checkpoint(
+                dpt_forward,
+                *tuple(aggregated_tokens_list),
+                use_reentrant=False,
+            )
+        else:
+            backbone_features = self.dpt_head(aggregated_tokens_list, images, patch_start_idx)
         _, _, _, H_out, W_out = backbone_features.shape
 
         # Side ResNet features from raw images
@@ -97,4 +111,3 @@ class FeatureExtractor(nn.Module):
         side_features = side_features.view(B, S, side_channels, H_out, W_out)
 
         return torch.cat([backbone_features, side_features], dim=2)
-

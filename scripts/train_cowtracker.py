@@ -511,6 +511,7 @@ def main():
             "visibility_loss": 0.0,
             "confidence_loss": 0.0,
             "loss_coord": 0.0,
+            "loss_invisible_coord": 0.0,
             "loss_vis": 0.0,
             "loss_conf": 0.0,
             "final_epe": 0.0,
@@ -557,6 +558,7 @@ def main():
                     f"epoch={epoch} step={global_step} "
                     f"loss={running['loss']/denom:.4f} "
                     f"loss_coord={running['loss_coord']/denom:.4f} "
+                    f"loss_invisible_coord={running['loss_invisible_coord']/denom:.4f} "
                     f"loss_vis={running['loss_vis']/denom:.4f} "
                     f"loss_conf={running['loss_conf']/denom:.4f} "
                     f"epe={running['final_epe']/denom:.4f} "
@@ -587,6 +589,7 @@ def main():
             print(
                 f"[Epoch {epoch}] loss={metrics['loss']:.4f}, "
                 f"loss_coord={metrics['loss_coord']:.4f}, "
+                f"loss_invisible_coord={metrics['loss_invisible_coord']:.4f}, "
                 f"loss_vis={metrics['loss_vis']:.4f}, "
                 f"loss_conf={metrics['loss_conf']:.4f}",
                 flush=True,
