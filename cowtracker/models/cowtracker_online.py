@@ -36,6 +36,8 @@ class CoWTrackerOnline(CoWTracker):
         window_len: int = 8,
         window_stride: int | None = None,
         num_memory_frames: int = 10,
+        use_history_frames: bool = True,
+        init_mode: str = "official",
         merge_mode: str = "overwrite",
         **cow_tracker_kwargs,
     ) -> None:
@@ -44,6 +46,7 @@ class CoWTrackerOnline(CoWTracker):
             int(window_stride) if window_stride is not None else max(1, resolved_window_len // 2)
         )
         resolved_num_memory_frames = int(num_memory_frames)
+        resolved_init_mode = str(init_mode).lower().strip()
         resolved_merge_mode = str(merge_mode).lower().strip()
 
         if resolved_window_len <= 0:
@@ -54,6 +57,8 @@ class CoWTrackerOnline(CoWTracker):
             raise ValueError("window_stride must be <= window_len to avoid temporal gaps.")
         if resolved_num_memory_frames < 0:
             raise ValueError("num_memory_frames must be non-negative.")
+        if resolved_init_mode not in {"official", "cotracker"}:
+            raise ValueError("init_mode must be one of: official, cotracker.")
         if resolved_merge_mode != "overwrite":
             raise ValueError("Only merge_mode='overwrite' is supported for now.")
 
@@ -61,6 +66,8 @@ class CoWTrackerOnline(CoWTracker):
         self.window_len = resolved_window_len
         self.window_stride = resolved_window_stride
         self.num_memory_frames = resolved_num_memory_frames
+        self.use_history_frames = bool(use_history_frames)
+        self.init_mode = resolved_init_mode
         self.merge_mode = resolved_merge_mode
         self.windowed = WindowedInference(
             window_len=self.window_len,
@@ -71,7 +78,9 @@ class CoWTrackerOnline(CoWTracker):
         print(
             "CoWTrackerOnline initialized: "
             f"window_len={self.window_len}, window_stride={self.window_stride}, "
-            f"num_memory_frames={self.num_memory_frames}, merge_mode={self.merge_mode}"
+            f"num_memory_frames={self.num_memory_frames}, "
+            f"use_history_frames={self.use_history_frames}, "
+            f"init_mode={self.init_mode}, merge_mode={self.merge_mode}"
         )
 
     def forward(
@@ -98,10 +107,12 @@ class CoWTrackerOnline(CoWTracker):
         accumulated = None
         iter_accumulated = None
         for window_idx, (start, end) in enumerate(windows):
-            memory_indices = self.windowed.select_memory_frames(window_idx, start)
-            frame_parts = [first_frame]
-            if memory_indices:
-                frame_parts.append(images[:, memory_indices])
+            memory_indices = self.windowed.select_memory_frames(window_idx, start) if self.use_history_frames else []
+            frame_parts = []
+            if self.use_history_frames:
+                frame_parts.append(first_frame)
+                if memory_indices:
+                    frame_parts.append(images[:, memory_indices])
             frame_parts.append(images[:, start:end])
             frames = torch.cat(frame_parts, dim=1)
 
@@ -114,12 +125,27 @@ class CoWTrackerOnline(CoWTracker):
                     print(f"  Memory frames: {memory_indices}")
 
             features = self._extract_window_features(frames)
-            first_frame_features = features[:, 0:1]
+            first_frame_features = features[:, 0:1] if self.use_history_frames else None
             num_memory = len(memory_indices)
+            tracked_features = features[:, 1:] if self.use_history_frames else features
+            init_track, init_vis, init_conf = self._build_window_init(
+                accumulated,
+                start,
+                end,
+                num_memory,
+                b,
+                height,
+                width,
+                device=tracked_features.device,
+                dtype=tracked_features.dtype,
+            )
             pred = self.tracking_head(
-                features[:, 1:],
+                tracked_features,
                 image_size=(height, width),
                 first_frame_features=first_frame_features,
+                init_track=init_track,
+                init_vis=init_vis,
+                init_conf=init_conf,
                 return_all_iters=return_all_iters,
             )
             window_pred = {
@@ -175,6 +201,73 @@ class CoWTrackerOnline(CoWTracker):
 
     def compute_windows(self, total_frames: int) -> list[tuple[int, int]]:
         return self.windowed.compute_windows(total_frames)
+
+    def _build_window_init(
+        self,
+        accumulated: dict | None,
+        window_start: int,
+        window_end: int,
+        num_memory: int,
+        batch_size: int,
+        height: int,
+        width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.init_mode == "official":
+            return None, None, None
+
+        window_len = window_end - window_start
+        total_len = num_memory + window_len
+        base_track = self._neutral_track_init(batch_size, total_len, height, width, device, dtype)
+        base_prob = torch.full((batch_size, total_len, height, width), 0.5, device=device, dtype=dtype)
+
+        if accumulated is None:
+            return base_track, base_prob.clone(), base_prob.clone()
+
+        batch_size = accumulated["track"].shape[0]
+        init_track = self._neutral_track_init(batch_size, total_len, height, width, device, dtype)
+        init_vis = torch.full((batch_size, total_len, height, width), 0.5, device=device, dtype=dtype)
+        init_conf = torch.full((batch_size, total_len, height, width), 0.5, device=device, dtype=dtype)
+
+        overlap_len = 0
+        if window_start > 0 and self.window_stride < self.window_len:
+            overlap_len = min(self.window_len - self.window_stride, window_len)
+
+        if overlap_len > 0:
+            prev_start = window_start
+            prev_end = window_start + overlap_len
+            dst_start = num_memory
+            dst_end = num_memory + overlap_len
+            init_track[:, dst_start:dst_end] = accumulated["track"][:, prev_start:prev_end].to(device=device, dtype=dtype)
+            init_vis[:, dst_start:dst_end] = accumulated["vis"][:, prev_start:prev_end].to(device=device, dtype=dtype)
+            init_conf[:, dst_start:dst_end] = accumulated["conf"][:, prev_start:prev_end].to(device=device, dtype=dtype)
+            if dst_end < total_len:
+                tail_track = init_track[:, dst_end - 1 : dst_end].expand(-1, total_len - dst_end, -1, -1, -1)
+                tail_vis = init_vis[:, dst_end - 1 : dst_end].expand(-1, total_len - dst_end, -1, -1)
+                tail_conf = init_conf[:, dst_end - 1 : dst_end].expand(-1, total_len - dst_end, -1, -1)
+                init_track[:, dst_end:] = tail_track
+                init_vis[:, dst_end:] = tail_vis
+                init_conf[:, dst_end:] = tail_conf
+
+        return init_track, init_vis, init_conf
+
+    @staticmethod
+    def _neutral_track_init(
+        batch_size: int,
+        total_len: int,
+        height: int,
+        width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        y, x = torch.meshgrid(
+            torch.arange(height, device=device, dtype=dtype),
+            torch.arange(width, device=device, dtype=dtype),
+            indexing="ij",
+        )
+        coords = torch.stack([x, y], dim=-1)
+        return coords.unsqueeze(0).unsqueeze(0).expand(batch_size, total_len, -1, -1, -1).clone()
 
     @staticmethod
     def _init_accumulated(
@@ -240,6 +333,7 @@ class CoWTrackerOnline(CoWTracker):
         window_len: int = 8,
         window_stride: int | None = None,
         num_memory_frames: int = 10,
+        use_history_frames: bool = True,
         merge_mode: str = "overwrite",
         device: str = "cuda",
         dtype=torch.bfloat16,
@@ -257,6 +351,7 @@ class CoWTrackerOnline(CoWTracker):
             window_len=window_len,
             window_stride=window_stride,
             num_memory_frames=num_memory_frames,
+            use_history_frames=use_history_frames,
             merge_mode=merge_mode,
             **model_kwargs,
         )

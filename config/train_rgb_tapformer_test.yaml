@@ -12,6 +12,14 @@ data:
   use_augs: false
   random_temporal_crop: true
   choose_long_point: false
+  # Online/windowed visualization only: backend implementation used by visualize_cowtracker.
+  online_backend: custom_online
+  # Online/windowed visualization only: maximum number of history frames used as memory.
+  online_num_memory_frames: 10
+  # Online/windowed visualization only: whether to prepend global first frame and sampled memory frames.
+  online_use_history_frames: True
+  # Online/windowed visualization only: cross-window initialization strategy.
+  online_init_mode: official
 
 model:
   features: 128
@@ -20,7 +28,8 @@ model:
   warp_iters: 5
   # Keep null unless the DPT intermediate indices are changed with it.
   warp_vit_num_blocks: null
-  limit_flow: true
+  # limit_flow: true
+  limit_flow: false
   max_flow_update_ratio: 0.15
   max_flow_magnitude_ratio: 1.0
   # VGGT aggregator can be initialized separately via train.vggt_checkpoint.
@@ -44,7 +53,7 @@ train:
   drop_last: true
   epochs: 200
   max_steps: null
-  lr: 0.0005
+  lr: 0.0003
   lr_scheduler: cosine
   min_lr: 0.000001
   warmup_steps: 0

@@ -16,7 +16,7 @@ model:
   cotracker_backbone_stride: null
   warp_iters: 5
   warp_vit_num_blocks: null
-  limit_flow: true
+  limit_flow: false
   max_flow_update_ratio: 0.15
   max_flow_magnitude_ratio: 1.0
   freeze_vggt: false
@@ -33,7 +33,7 @@ train:
   drop_last: true
   epochs: 500
   max_steps: null
-  lr: 0.0005
+  lr: 0.0003
   lr_scheduler: cosine
   min_lr: 0.000001
   warmup_steps: 0

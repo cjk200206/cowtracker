@@ -111,6 +111,9 @@ class CowTrackingHead(nn.Module):
         features: torch.Tensor,
         image_size: Tuple[int, int],
         first_frame_features: torch.Tensor = None,
+        init_track: torch.Tensor = None,
+        init_vis: torch.Tensor = None,
+        init_conf: torch.Tensor = None,
         return_all_iters: bool = False,
     ) -> dict:
         """
@@ -121,6 +124,12 @@ class CowTrackingHead(nn.Module):
             image_size: Original image size (H_img, W_img) for upsampling.
             first_frame_features: Optional first frame features [B, 1, C, H, W]
                 for cross-window tracking.
+            init_track: Optional absolute track initialization
+                [B, S, H_img, W_img, 2].
+            init_vis: Optional visibility probability initialization
+                [B, S, H_img, W_img].
+            init_conf: Optional confidence probability initialization
+                [B, S, H_img, W_img].
             return_all_iters: If True, also return dense predictions from every
                 warping refinement iteration for training-time sequence loss.
 
@@ -148,8 +157,9 @@ class CowTrackingHead(nn.Module):
             torch.cat([frame0_expanded, fmap], dim=2).view(B * S, -1, H, W)
         ).view(B, S, -1, H, W)
 
-        # Initialize flow to zero
-        flow = torch.zeros(B, S, 2, H, W, device=features.device, dtype=features.dtype)
+        # Initialize flow and info from optional previous-window predictions.
+        flow = self._init_flow(init_track, B, S, H, W, H_img, W_img, features.device, features.dtype)
+        info = self._init_info(init_vis, init_conf, B, S, H, W, features.device, features.dtype)
         iter_predictions = []
 
         # Iterative refinement
@@ -181,7 +191,7 @@ class CowTrackingHead(nn.Module):
             # Predict flow and info update
             update = self.flow_head(net.view(B * S, -1, H, W)).view(B, S, 4, H, W)
             flow = self._apply_flow_update(flow, update[:, :, :2])
-            info = update[:, :, 2:]
+            info = self._apply_info_update(info, update[:, :, 2:])
 
             if return_all_iters:
                 iter_predictions.append(
@@ -200,6 +210,54 @@ class CowTrackingHead(nn.Module):
             predictions["conf_iters"] = [pred["conf"] for pred in iter_predictions]
 
         return predictions
+
+    def _init_flow(
+        self,
+        init_track: torch.Tensor | None,
+        B: int,
+        S: int,
+        H: int,
+        W: int,
+        H_img: int,
+        W_img: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if init_track is None:
+            return torch.zeros(B, S, 2, H, W, device=device, dtype=dtype)
+
+        coords = coords_grid(B * S, H_img, W_img, device=device).to(dtype).view(B, S, 2, H_img, W_img)
+        init_track = init_track.to(device=device, dtype=dtype).permute(0, 1, 4, 2, 3)
+        disp = init_track - coords
+        disp = (disp / float(self.down_ratio)).view(B * S, 2, H_img, W_img)
+        disp = F.interpolate(disp, size=(H, W), mode="bilinear", align_corners=True)
+        return disp.view(B, S, 2, H, W)
+
+    def _init_info(
+        self,
+        init_vis: torch.Tensor | None,
+        init_conf: torch.Tensor | None,
+        B: int,
+        S: int,
+        H: int,
+        W: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        info = torch.zeros(B * S, 2, H, W, device=device, dtype=dtype)
+        inits = [init_vis, init_conf]
+        for idx, init_prob in enumerate(inits):
+            if init_prob is None:
+                continue
+            prob = init_prob.to(device=device, dtype=dtype).clamp(1e-4, 1.0 - 1e-4)
+            prob = prob.view(B * S, 1, prob.shape[-2], prob.shape[-1])
+            prob = F.interpolate(prob, size=(H, W), mode="bilinear", align_corners=True)
+            info[:, idx : idx + 1] = torch.logit(prob)
+        return info.view(B, S, 2, H, W)
+
+    @staticmethod
+    def _apply_info_update(info: torch.Tensor, raw_info: torch.Tensor) -> torch.Tensor:
+        return raw_info + info
 
     def _run_refine_net(self, refine_inp: torch.Tensor) -> torch.Tensor:
         def refine_forward(x):

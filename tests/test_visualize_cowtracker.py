@@ -25,6 +25,8 @@ def _args(**kwargs):
         "online": False,
         "window_len": None,
         "window_stride": None,
+        "num_memory_frames": None,
+        "disable_history_frames": False,
         "num_points": 4,
         "point_source": "gt",
         "precision": None,
@@ -48,7 +50,15 @@ def _args(**kwargs):
 
 def _setup_common(monkeypatch, args):
     batch = _Batch()
-    cfg = {"train": {"precision": "bf16"}}
+    cfg = {
+        "train": {"precision": "bf16"},
+        "data": {
+            "online_backend": "custom_online",
+            "online_num_memory_frames": 10,
+            "online_use_history_frames": True,
+            "online_init_mode": "official",
+        },
+    }
     gt_tracks = torch.zeros(1, 3, 4, 2)
     gt_visibility = torch.ones(1, 3, 4, dtype=torch.bool)
     query_xy = torch.zeros(1, 4, 2)
@@ -149,3 +159,104 @@ def test_non_gt_only_path_unchanged(monkeypatch):
     )
 
     vis.main()
+
+
+def test_build_visualization_model_custom_online_backend(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(vis, "ensure_vggt_available", lambda: None)
+
+    class DummyOnline:
+        def __init__(self, **kwargs):
+            captured["kwargs"] = kwargs
+
+        def to(self, device):
+            captured["device"] = device
+            return self
+
+        def load_state_dict(self, state_dict, strict=False):
+            captured["state_dict_keys"] = sorted(state_dict.keys())
+            captured["strict"] = strict
+            return type("LoadResult", (), {"missing_keys": [], "unexpected_keys": []})()
+
+        def eval(self):
+            return self
+
+        def parameters(self):
+            return []
+
+    class DummyOffline:
+        def __init__(self, **kwargs):
+            raise AssertionError("offline model should not be constructed")
+
+    monkeypatch.setattr("cowtracker.models.cowtracker_online.CoWTrackerOnline", DummyOnline)
+    monkeypatch.setattr("cowtracker.models.cowtracker.CoWTracker", DummyOffline)
+
+    cfg = {
+        "data": {
+            "online_backend": "custom_online",
+            "seq_len": 12,
+            "online_num_memory_frames": 6,
+            "online_use_history_frames": True,
+            "online_init_mode": "official",
+        },
+        "model": {},
+    }
+    model = vis.build_visualization_model({"model": {}}, cfg, torch.device("cpu"), use_online=True)
+
+    assert isinstance(model, DummyOnline)
+    assert captured["kwargs"]["window_len"] == 12
+    assert captured["kwargs"]["window_stride"] == 6
+    assert captured["kwargs"]["num_memory_frames"] == 6
+    assert captured["kwargs"]["use_history_frames"] is True
+    assert captured["kwargs"]["init_mode"] == "official"
+    assert captured["state_dict_keys"] == []
+
+
+def test_build_visualization_model_official_windowed_backend_adds_model_prefix(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(vis, "ensure_vggt_available", lambda: None)
+
+    class DummyWindowed:
+        def __init__(self, **kwargs):
+            captured["kwargs"] = kwargs
+
+        def to(self, device):
+            captured["device"] = device
+            return self
+
+        def load_state_dict(self, state_dict, strict=False):
+            captured["state_dict_keys"] = sorted(state_dict.keys())
+            captured["strict"] = strict
+            return type("LoadResult", (), {"missing_keys": [], "unexpected_keys": []})()
+
+        def eval(self):
+            return self
+
+        def parameters(self):
+            return []
+
+    class DummyOffline:
+        def __init__(self, **kwargs):
+            raise AssertionError("offline model should not be constructed")
+
+    monkeypatch.setattr("cowtracker.models.cowtracker_windowed.CoWTrackerWindowed", DummyWindowed)
+    monkeypatch.setattr("cowtracker.models.cowtracker.CoWTracker", DummyOffline)
+
+    cfg = {
+        "data": {
+            "online_backend": "official_windowed",
+            "seq_len": 16,
+            "online_num_memory_frames": 4,
+            "online_use_history_frames": False,
+            "online_init_mode": "cotracker",
+        },
+        "model": {},
+    }
+    ckpt = {"model": {"aggregator.weight": torch.tensor(1.0)}}
+    model = vis.build_visualization_model(ckpt, cfg, torch.device("cpu"), use_online=True, window_stride=8)
+
+    assert isinstance(model, DummyWindowed)
+    assert captured["kwargs"]["window_len"] == 16
+    assert captured["kwargs"]["stride"] == 8
+    assert captured["kwargs"]["num_memory_frames"] == 4
+    assert captured["state_dict_keys"] == ["model.aggregator.weight"]

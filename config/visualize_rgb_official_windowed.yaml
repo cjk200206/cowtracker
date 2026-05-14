@@ -1,0 +1,32 @@
+data:
+  data_root: data/event_kubric
+  split: test
+  seq_len: 10
+  traj_per_sample: 256
+  crop_size: [448, 448]
+  frame_source: blur
+  use_augs: false
+  random_temporal_crop: false
+  choose_long_point: false
+  online_backend: official_windowed
+  online_num_memory_frames: 10
+  online_use_history_frames: true
+  online_init_mode: official
+
+model:
+  features: 128
+  side_resnet_channels: 128
+  down_ratio: 2
+  warp_iters: 5
+  warp_vit_num_blocks: null
+  limit_flow: false
+  max_flow_update_ratio: 0.15
+  max_flow_magnitude_ratio: 1.0
+  freeze_vggt: true
+  freeze_aggregator: true
+  freeze_feature_extractor: false
+  freeze_tracking_head: false
+  dpt_checkpoint: true
+
+train:
+  precision: bf16

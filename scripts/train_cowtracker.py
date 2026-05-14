@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 import os
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 import argparse
 import json

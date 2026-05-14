@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # Force using only the first GPU for visualization
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Force using only the first GPU for visualization
 
 import argparse
 import copy
@@ -58,6 +58,8 @@ def parse_args():
     parser.add_argument("--online", action="store_true")
     parser.add_argument("--window_len", type=int, default=None)
     parser.add_argument("--window_stride", type=int, default=None)
+    parser.add_argument("--num_memory_frames", type=int, default=None)
+    parser.add_argument("--disable_history_frames", action="store_true")
     parser.add_argument("--num_points", type=int, default=128)
     parser.add_argument("--point_source", choices=("gt", "grid"), default="gt")
     parser.add_argument("--precision", choices=("bf16", "fp16", "fp32"), default=None)
@@ -108,6 +110,9 @@ def build_visualization_model(
     use_online: bool = False,
     window_len: int | None = None,
     window_stride: int | None = None,
+    num_memory_frames: int | None = None,
+    use_history_frames: bool | None = None,
+    init_mode: str | None = None,
 ):
     model_cfg_source = ckpt.get("config", cfg) if isinstance(ckpt, dict) else cfg
     if model_uses_vggt(model_cfg_source):
@@ -115,15 +120,50 @@ def build_visualization_model(
 
     from cowtracker.models.cowtracker import CoWTracker
     from cowtracker.models.cowtracker_online import CoWTrackerOnline
+    from cowtracker.models.cowtracker_windowed import CoWTrackerWindowed
 
     model_kwargs = model_kwargs_from_config(model_cfg_source)
     if use_online:
+        resolved_backend = str(cfg.get("data", {}).get("online_backend", "custom_online")).lower().strip()
         resolved_window_len = int(window_len or cfg.get("data", {}).get("seq_len", 8))
-        model = CoWTrackerOnline(
-            window_len=resolved_window_len,
-            window_stride=window_stride,
-            **model_kwargs,
-        ).to(device)
+        resolved_num_memory_frames = int(
+            num_memory_frames
+            if num_memory_frames is not None
+            else cfg.get("data", {}).get("online_num_memory_frames", 10)
+        )
+        resolved_window_stride = (
+            int(window_stride)
+            if window_stride is not None
+            else max(1, resolved_window_len // 2)
+        )
+        if resolved_backend == "official_windowed":
+            model = CoWTrackerWindowed(
+                window_len=resolved_window_len,
+                stride=resolved_window_stride,
+                num_memory_frames=resolved_num_memory_frames,
+                **model_kwargs,
+            ).to(device)
+        elif resolved_backend == "custom_online":
+            resolved_use_history_frames = bool(
+                cfg.get("data", {}).get("online_use_history_frames", True)
+                if use_history_frames is None
+                else use_history_frames
+            )
+            resolved_init_mode = str(
+                cfg.get("data", {}).get("online_init_mode", "official")
+                if init_mode is None
+                else init_mode
+            ).lower().strip()
+            model = CoWTrackerOnline(
+                window_len=resolved_window_len,
+                window_stride=resolved_window_stride,
+                num_memory_frames=resolved_num_memory_frames,
+                use_history_frames=resolved_use_history_frames,
+                init_mode=resolved_init_mode,
+                **model_kwargs,
+            ).to(device)
+        else:
+            raise ValueError("data.online_backend must be one of: custom_online, official_windowed")
     else:
         model = CoWTracker(**model_kwargs).to(device)
     state_dict = extract_state_dict(ckpt)
@@ -136,8 +176,12 @@ def build_visualization_model(
     ]
     if any(k.startswith(prefix) for k in state_dict for prefix in legacy_prefixes):
         state_dict = CoWTracker._remap_legacy_state_dict(state_dict)
-    if state_dict and all(k.startswith("model.") for k in state_dict):
-        state_dict = {k[len("model.") :]: v for k, v in state_dict.items()}
+    if use_online and str(cfg.get("data", {}).get("online_backend", "custom_online")).lower().strip() == "official_windowed":
+        if state_dict and not any(k.startswith("model.") for k in state_dict):
+            state_dict = {f"model.{k}": v for k, v in state_dict.items()}
+    else:
+        if state_dict and all(k.startswith("model.") for k in state_dict):
+            state_dict = {k[len("model.") :]: v for k, v in state_dict.items()}
 
     incompatible = model.load_state_dict(state_dict, strict=False)
     print(
@@ -295,10 +339,17 @@ def main():
             use_online=use_online,
             window_len=args.window_len,
             window_stride=args.window_stride,
+            num_memory_frames=args.num_memory_frames,
+            use_history_frames=(None if not args.disable_history_frames else False),
+            init_mode=None,
         )
         with torch.no_grad():
             with torch.autocast(device_type=device.type, dtype=amp_dtype or torch.float32, enabled=use_amp):
-                predictions = model(batch.video, return_all_iters=False)
+                online_backend = str(cfg.get("data", {}).get("online_backend", "custom_online")).lower().strip()
+                if use_online and online_backend == "official_windowed":
+                    predictions = model(batch.video)
+                else:
+                    predictions = model(batch.video, return_all_iters=False)
 
         pred_track, pred_vis, pred_conf = sample_sparse_predictions(predictions, query_xy)
         pred_visibility = pred_vis > float(args.vis_threshold)
@@ -352,6 +403,7 @@ def main():
         f"online={use_online} "
         f"window_len={getattr(model, 'window_len', None) if model is not None else None} "
         f"window_stride={getattr(model, 'window_stride', None) if model is not None else None} "
+        f"num_memory_frames={getattr(model, 'num_memory_frames', None) if model is not None else None} "
         f"num_windows={len(getattr(model, 'last_windows', [])) if model is not None else 0}",
         flush=True,
     )

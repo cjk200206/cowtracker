@@ -23,6 +23,13 @@ def _make_flow_update_head(limit_flow, update_ratio=0.15, magnitude_ratio=1.0):
     return head
 
 
+def _make_init_head(down_ratio=2):
+    head = CowTrackingHead.__new__(CowTrackingHead)
+    torch.nn.Module.__init__(head)
+    head.down_ratio = int(down_ratio)
+    return head
+
+
 def _write_sample(root, num_frames=5, height=16, width=20, num_points=3):
     seq = root / "test" / "000000"
     raw = seq / "raw"
@@ -92,6 +99,28 @@ def test_dense_loss_backward():
     assert out["loss_conf"] is out["confidence_loss"]
 
 
+def test_invisible_coord_loss_uses_coord_error_when_huber_enabled():
+    b, t, h, w, n = 1, 2, 2, 2, 1
+    dense_track = torch.zeros(b, t, h, w, 2)
+    dense_track[..., 0] = 10.0
+    dense_vis = torch.full((b, t, h, w), 0.5)
+    dense_conf = torch.full((b, t, h, w), 0.5)
+    gt = torch.zeros(b, t, n, 2)
+    visibility = torch.tensor([[[1.0], [0.0]]])
+    valid = torch.ones(b, t, n)
+
+    criterion = CowTrackerDenseLoss(use_huber=True, huber_delta=6.0)
+    out = criterion(
+        {"track": dense_track, "vis": dense_vis, "conf": dense_conf},
+        gt,
+        visibility,
+        valid,
+    )
+
+    assert torch.allclose(out["loss_coord"], torch.tensor(21.0))
+    assert torch.allclose(out["loss_invisible_coord"], torch.tensor(21.0))
+
+
 def test_sample_dense_predictions_for_visualization():
     b, t, h, w = 1, 2, 6, 8
     yy, xx = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
@@ -103,6 +132,35 @@ def test_sample_dense_predictions_for_visualization():
     assert sampled.shape == (b, t, 2, 2)
     assert torch.allclose(sampled[:, :, 0], torch.tensor([[[2.0, 3.0], [2.0, 3.0]]]))
     assert torch.allclose(sampled[:, :, 1], torch.tensor([[[5.0, 1.0], [5.0, 1.0]]]))
+
+
+def test_tracking_head_none_initializers_match_zero_defaults():
+    head = _make_init_head(down_ratio=2)
+
+    flow = head._init_flow(
+        init_track=None,
+        B=1,
+        S=3,
+        H=4,
+        W=5,
+        H_img=8,
+        W_img=10,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    info = head._init_info(
+        init_vis=None,
+        init_conf=None,
+        B=1,
+        S=3,
+        H=4,
+        W=5,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert torch.equal(flow, torch.zeros(1, 3, 2, 4, 5))
+    assert torch.equal(info, torch.zeros(1, 3, 2, 4, 5))
 
 
 def test_flow_limit_disabled_preserves_residual_update():
@@ -202,11 +260,23 @@ def test_cowtracker_online_sliding_windows_use_memory_and_windowed_merge():
             super().__init__()
             object.__setattr__(self, "owner", owner)
 
-        def forward(self, features, image_size, first_frame_features=None, return_all_iters=False):
+        def forward(
+            self,
+            features,
+            image_size,
+            first_frame_features=None,
+            init_track=None,
+            init_vis=None,
+            init_conf=None,
+            return_all_iters=False,
+        ):
             del image_size, return_all_iters
             first_value = first_frame_features[:, :, 0, 0, 0].detach().cpu().tolist()[0]
             feature_values = features[:, :, 0, 0, 0].detach().cpu().tolist()[0]
-            self.owner.calls.append(first_value + feature_values)
+            init_track_values = None if init_track is None else init_track[:, :, 0, 0, 0].detach().cpu().tolist()[0]
+            init_vis_values = None if init_vis is None else init_vis[:, :, 0, 0].detach().cpu().tolist()[0]
+            init_conf_values = None if init_conf is None else init_conf[:, :, 0, 0].detach().cpu().tolist()[0]
+            self.owner.calls.append((first_value + feature_values, init_track_values, init_vis_values, init_conf_values))
             call_offset = 100 * (len(self.owner.calls) - 1)
 
             b, t, _, h, w = features.shape
@@ -225,6 +295,7 @@ def test_cowtracker_online_sliding_windows_use_memory_and_windowed_merge():
             self.window_len = 4
             self.window_stride = 2
             self.num_memory_frames = 10
+            self.init_mode = "cotracker"
             self.merge_mode = "overwrite"
             self.windowed = WindowedInference(
                 window_len=self.window_len,
@@ -245,17 +316,82 @@ def test_cowtracker_online_sliding_windows_use_memory_and_windowed_merge():
     out = model(video)
 
     assert model.last_windows == [(0, 4), (2, 6), (4, 8), (6, 10)]
-    assert model.calls == [
+    assert [call[0] for call in model.calls] == [
         [0.0, 0.0, 1.0, 2.0, 3.0],
         [0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
         [0.0, 0.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
         [0.0, 0.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
     ]
+    assert model.calls[0][1] == [0.0, 1.0, 2.0, 3.0]
+    assert model.calls[1][1] == [0.0, 1.0, 2.0, 3.0, 3.0, 3.0]
+    assert model.calls[2][1] == [0.0, 2.0, 3.0, 4.0, 5.0, 5.0, 5.0]
+    assert model.calls[3][1] == [0.0, 4.0, 5.0, 6.0, 7.0, 7.0, 7.0]
+    assert model.calls[1][2] == [0.5, 0.5, 1.0, 1.0, 1.0, 1.0]
+    assert model.calls[1][3] == [0.5, 0.5, 1.0, 1.0, 1.0, 1.0]
     assert out["track"].shape == (1, 10, 2, 2, 2)
     assert torch.equal(
         out["track"][0, :, 0, 0, 0],
         torch.tensor([0.0, 1.0, 2.0, 3.0, 104.0, 105.0, 206.0, 207.0, 308.0, 309.0]),
     )
+
+
+def test_cowtracker_online_official_init_mode_skips_prev_window_state():
+    from cowtracker.inference.windowed import WindowedInference
+    from cowtracker.models.cowtracker_online import CoWTrackerOnline
+
+    class TinyTrackingHead(torch.nn.Module):
+        def __init__(self, owner):
+            super().__init__()
+            self.owner = owner
+
+        def forward(
+            self,
+            features,
+            image_size,
+            first_frame_features=None,
+            init_track=None,
+            init_vis=None,
+            init_conf=None,
+            return_all_iters=False,
+        ):
+            del features, image_size, first_frame_features, return_all_iters
+            self.owner.init_calls.append((init_track, init_vis, init_conf))
+            return {
+                "track": torch.zeros((1, 4, 2, 2, 2)),
+                "vis": torch.ones((1, 4, 2, 2)),
+                "conf": torch.ones((1, 4, 2, 2)),
+            }
+
+    class TinyOnline(CoWTrackerOnline):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.window_len = 4
+            self.window_stride = 2
+            self.num_memory_frames = 10
+            self.use_history_frames = True
+            self.init_mode = "official"
+            self.merge_mode = "overwrite"
+            self.windowed = WindowedInference(
+                window_len=self.window_len,
+                stride=self.window_stride,
+                num_memory_frames=self.num_memory_frames,
+            )
+            self.last_windows = []
+            self.backbone_type = "cotracker3"
+            self.tracking_head = TinyTrackingHead(self)
+            self.init_calls = []
+
+        def _extract_window_features(self, frames):
+            return frames
+
+    model = TinyOnline().eval()
+    video = (torch.arange(6) * 255).view(1, 6, 1, 1, 1).repeat(1, 1, 3, 2, 2).float()
+
+    out = model(video)
+
+    assert model.last_windows == [(0, 4), (2, 6)]
+    assert model.init_calls == [(None, None, None), (None, None, None)]
+    assert out["track"].shape == (1, 6, 2, 2, 2)
 
 
 def test_cowtracker_online_short_video_uses_single_window():
@@ -266,6 +402,7 @@ def test_cowtracker_online_short_video_uses_single_window():
             torch.nn.Module.__init__(self)
             self.window_len = 4
             self.window_stride = 2
+            self.init_mode = "cotracker"
             self.merge_mode = "overwrite"
             self.last_windows = []
             self.calls = 0
@@ -307,9 +444,21 @@ def test_cowtracker_online_windowed_path_supports_cotracker3_and_iters():
             super().__init__()
             self.calls = 0
 
-        def forward(self, features, image_size, first_frame_features=None, return_all_iters=False):
+        def forward(
+            self,
+            features,
+            image_size,
+            first_frame_features=None,
+            init_track=None,
+            init_vis=None,
+            init_conf=None,
+            return_all_iters=False,
+        ):
             del image_size
             assert first_frame_features[:, :, 0, 0, 0].eq(0).all()
+            assert init_track is not None
+            assert init_vis is not None
+            assert init_conf is not None
             self.calls += 1
             b, t, _, h, w = features.shape
             values = features[:, :, 0, 0, 0].view(b, t, 1, 1) + 100 * (self.calls - 1)
@@ -332,6 +481,7 @@ def test_cowtracker_online_windowed_path_supports_cotracker3_and_iters():
             self.window_len = 4
             self.window_stride = 2
             self.num_memory_frames = 10
+            self.init_mode = "cotracker"
             self.merge_mode = "overwrite"
             self.windowed = WindowedInference(
                 window_len=self.window_len,
@@ -361,6 +511,77 @@ def test_cowtracker_online_windowed_path_supports_cotracker3_and_iters():
         out["track_iters"][1][0, :, 0, 0, 0],
         torch.tensor([20.0, 21.0, 22.0, 23.0, 124.0, 125.0]),
     )
+
+
+def test_cowtracker_online_can_disable_history_frames():
+    from cowtracker.inference.windowed import WindowedInference
+    from cowtracker.models.cowtracker_online import CoWTrackerOnline
+
+    class TinyTrackingHead(torch.nn.Module):
+        def __init__(self, owner):
+            super().__init__()
+            self.owner = owner
+
+        def forward(
+            self,
+            features,
+            image_size,
+            first_frame_features=None,
+            init_track=None,
+            init_vis=None,
+            init_conf=None,
+            return_all_iters=False,
+        ):
+            del image_size, init_vis, init_conf, return_all_iters
+            self.owner.feature_calls.append(features[:, :, 0, 0, 0].detach().cpu().tolist()[0])
+            self.owner.first_frame_features.append(first_frame_features)
+            self.owner.init_track_values.append(init_track[:, :, 0, 0, 0].detach().cpu().tolist()[0])
+            b, t, _, h, w = features.shape
+            track = features.new_zeros((b, t, h, w, 2))
+            track[..., 0] = features[:, :, 0, 0, 0].view(b, t, 1, 1)
+            return {
+                "track": track,
+                "vis": features.new_ones((b, t, h, w)),
+                "conf": features.new_ones((b, t, h, w)),
+            }
+
+    class TinyOnline(CoWTrackerOnline):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.window_len = 4
+            self.window_stride = 2
+            self.num_memory_frames = 10
+            self.use_history_frames = False
+            self.init_mode = "cotracker"
+            self.merge_mode = "overwrite"
+            self.windowed = WindowedInference(
+                window_len=self.window_len,
+                stride=self.window_stride,
+                num_memory_frames=self.num_memory_frames,
+            )
+            self.last_windows = []
+            self.backbone_type = "cotracker3"
+            self.tracking_head = TinyTrackingHead(self)
+            self.feature_calls = []
+            self.first_frame_features = []
+            self.init_track_values = []
+
+        def _extract_window_features(self, frames):
+            return frames
+
+    model = TinyOnline().eval()
+    video = (torch.arange(6) * 255).view(1, 6, 1, 1, 1).repeat(1, 1, 3, 2, 2).float()
+
+    out = model(video)
+
+    assert model.last_windows == [(0, 4), (2, 6)]
+    assert model.feature_calls == [[0.0, 1.0, 2.0, 3.0], [2.0, 3.0, 4.0, 5.0]]
+    assert model.first_frame_features == [None, None]
+    assert model.init_track_values == [
+        [0.0, 1.0, 2.0, 3.0],
+        [2.0, 3.0, 3.0, 3.0],
+    ]
+    assert out["track"].shape == (1, 6, 2, 2, 2)
 
 
 def test_dense_loss_supports_iteration_predictions():
